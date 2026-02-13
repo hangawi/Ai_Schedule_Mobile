@@ -6,6 +6,10 @@ const { mergeConsecutiveSlots } = require('../utils/slotUtils');
 const { getDayOfWeekNumber } = require('../utils/timeUtils');
 const { removePreferenceTimes } = require('../helpers/preferenceTimeHelper');
 
+const Room = require('../../../models/room'); // Room 모델 추가
+const { validateRoomExists, validateOwnerPermission } = require('../validators'); // 검증 헬퍼 추가
+const { HTTP_STATUS, ERROR_MESSAGES } = require('../constants'); // 상수 추가
+
 /**
  * 슬롯을 사용자별, 날짜별로 그룹화
  * @param {Array} autoAssignedSlots - 자동 배정 슬롯
@@ -443,6 +447,65 @@ const confirmSlotsToPersonalCalendar = async (autoAssignedSlots, room, travelMod
   };
 };
 
+/**
+ * 스케줄 확정 API 컨트롤러
+ * @param {Object} req - Request 객체
+ * @param {Object} res - Response 객체
+ */
+const confirmScheduleController = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { travelMode } = req.body;
+
+    // 방 조회
+    const room = await Room.findById(roomId)
+      .populate('owner', 'firstName lastName email personalTimes defaultSchedule scheduleExceptions')
+      .populate('members.user', '_id firstName lastName email personalTimes defaultSchedule scheduleExceptions');
+
+    if (!validateRoomExists(room, res)) return;
+    if (!validateOwnerPermission(room, req.user.id, res)) return;
+
+    // 중복 확정 방지
+    if (room.confirmedAt) {
+      return res.status(HTTP_STATUS.BAD_REQUEST).json({ msg: ERROR_MESSAGES.ALREADY_CONFIRMED });
+    }
+
+    // 자동배정된 슬롯 필터링
+    const autoAssignedSlots = room.timeSlots.filter(slot =>
+      slot.assignedBy && slot.status === 'confirmed' && !slot.isTravel
+    );
+
+    if (autoAssignedSlots.length === 0) {
+      return res.status(HTTP_STATUS.BAD_REQUEST).json({ msg: '확정할 자동배정 시간이 없습니다.' });
+    }
+    
+    // 이월 서비스에서 userId와 userName을 가져오기 위함
+    const user = await User.findById(req.user.id);
+    const userName = user ? `${user.firstName} ${user.lastName}` : 'Unknown';
+
+    // 핵심 로직 호출
+    const result = await confirmSlotsToPersonalCalendar(
+      autoAssignedSlots,
+      room,
+      travelMode,
+      req.user.id,
+      userName
+    );
+    
+    res.json({
+      msg: '배정 시간이 각 조원과 방장의 개인일정으로 확정되었습니다.',
+      confirmedSlotsCount: result.confirmedSlotsCount,
+      mergedSlotsCount: result.mergedSlotsCount,
+      affectedMembersCount: result.affectedMembersCount,
+      confirmedTravelMode: result.travelMode
+    });
+    
+  } catch (error) {
+    console.error('Error confirming schedule:', error);
+    res.status(HTTP_STATUS.INTERNAL_ERROR).json({ msg: `확정 처리 중 오류가 발생했습니다: ${error.message}` });
+  }
+};
+
 module.exports = {
   confirmSlotsToPersonalCalendar,
   groupSlotsByUserAndDate,
@@ -455,4 +518,5 @@ module.exports = {
   finalizeConfirmation,
   logConfirmActivity,
   emitConfirmEvent,
+  confirmScheduleController, // 새 컨트롤러 함수 export
 };

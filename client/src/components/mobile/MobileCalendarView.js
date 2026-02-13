@@ -1,10 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import FullCalendar from '@fullcalendar/react';
-import dayGridPlugin from '@fullcalendar/daygrid';
-import timeGridPlugin from '@fullcalendar/timegrid';
-import interactionPlugin from '@fullcalendar/interaction';
-import { Menu, LogOut, User, Calendar, Clipboard, ClipboardX, Phone, Settings, FileText } from 'lucide-react';
+
+import { Calendar, Settings, FileText } from 'lucide-react';
 import { auth } from '../../config/firebaseConfig';
 import { useBackgroundMonitoring } from '../../hooks/useBackgroundMonitoring';
 import BottomNavigation from './BottomNavigation';
@@ -21,11 +18,15 @@ import useCalendarData from './calendarView/hooks/useCalendarData';
 import { createCalendarHandlers } from './calendarView/hooks/useCalendarHandlers';
 import useTouchGesture from './calendarView/hooks/useTouchGesture';
 import useCameraOCR from './calendarView/hooks/useCameraOCR';
+import { useVoiceRecognition } from './calendarView/hooks/useVoiceRecognition';
 import BottomSection from './calendarView/components/BottomSection';
+import CalendarContent from './calendarView/components/CalendarContent';
+import EventEditPanel from './calendarView/components/EventEditPanel';
+import CalendarHeader from './calendarView/components/CalendarHeader';
 
 import './MobileCalendarView.css';
 
-const MobileCalendarView = ({ user, isClipboardMonitoring, setIsClipboardMonitoring, isVoiceEnabled, setIsVoiceEnabled }) => {
+const MobileCalendarView = ({ user, isClipboardMonitoring, setIsClipboardMonitoring, setIsVoiceEnabled }) => {
    const navigate = useNavigate();
    const [searchParams, setSearchParams] = useSearchParams();
    const calendarRef = useRef(null);
@@ -80,7 +81,6 @@ const MobileCalendarView = ({ user, isClipboardMonitoring, setIsClipboardMonitor
       handleDateClick, handleEventClick, handleDeleteScheduleEvent,
       handleSplitItemClick, handleOpenMap, handleCloseMapModal,
       handleViewChange, handleLogout, handleChatMessage,
-      handleStartVoiceRecognition,
    } = createCalendarHandlers({
       defaultSchedule, setDefaultSchedule,
       scheduleExceptions, setScheduleExceptions,
@@ -101,6 +101,17 @@ const MobileCalendarView = ({ user, isClipboardMonitoring, setIsClipboardMonitor
       setIsVoiceEnabled,
       setShowMapModal, setSelectedLocation,
       setCalendarView, setCurrentTitle,
+   });
+
+   // --- 음성 인식 훅 ---
+   const { handleStartVoiceRecognition } = useVoiceRecognition({
+      showToast,
+      setIsVoiceEnabled,
+      isChatOpen,
+      setIsChatOpen,
+      handleChatMessage,
+      isBackgroundMonitoring,
+      processTranscript,
    });
 
    // --- 백그라운드 대화 감지 훅 ---
@@ -140,97 +151,24 @@ const MobileCalendarView = ({ user, isClipboardMonitoring, setIsClipboardMonitor
       }
    }, []);
 
-   // --- 백그라운드 음성 인식 ---
-   useEffect(() => {
-      if (!isBackgroundMonitoring) {
-         if (backgroundRecognitionRef.current) {
-            backgroundRecognitionRef.current.stop();
-            backgroundRecognitionRef.current = null;
-         }
-         return;
-      }
 
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SpeechRecognition) {
-         showToast('이 브라우저에서는 음성 인식을 지원하지 않습니다.');
-         return;
-      }
-
-      const recognition = new SpeechRecognition();
-      recognition.lang = 'ko-KR';
-      recognition.continuous = true;
-      recognition.interimResults = true;
-
-      recognition.onresult = (event) => {
-         for (let i = event.resultIndex; i < event.results.length; i++) {
-            const transcript = event.results[i][0].transcript;
-            const isFinal = event.results[i].isFinal;
-            processTranscript(transcript, isFinal);
-         }
-      };
-
-      recognition.onerror = (event) => {
-         console.warn('백그라운드 음성 인식 오류:', event.error);
-         if (event.error === 'not-allowed') {
-            showToast('마이크 권한이 필요합니다.');
-         }
-      };
-
-      recognition.onend = () => {
-         if (isBackgroundMonitoring && backgroundRecognitionRef.current) {
-            try {
-               recognition.start();
-            } catch (e) {
-               console.warn('음성 인식 재시작 실패:', e);
-            }
-         }
-      };
-
-      try {
-         recognition.start();
-         backgroundRecognitionRef.current = recognition;
-      } catch (e) {
-         console.error('음성 인식 시작 실패:', e);
-      }
-
-      return () => {
-         if (backgroundRecognitionRef.current) {
-            backgroundRecognitionRef.current.stop();
-            backgroundRecognitionRef.current = null;
-         }
-      };
-   }, [isBackgroundMonitoring, processTranscript]);
 
    // --- 렌더링 ---
    if (showScheduleEdit) return <MobileScheduleEdit onBack={() => setShowScheduleEdit(false)} />;
 
    return (
       <div className={`mobile-calendar-view view-${calendarView} ${calendarView === 'timeGridDay' ? 'split-mode' : ''}`}>
-         {isSidebarOpen && <div className="sidebar-overlay" onClick={() => setIsSidebarOpen(false)}></div>}
-         <nav className={`mobile-sidebar ${isSidebarOpen ? 'open' : ''}`}>
-            <div className="sidebar-header"><h2 className="sidebar-title">메뉴</h2><button className="sidebar-close-btn" onClick={() => setIsSidebarOpen(false)}>✕</button></div>
-            <div className="sidebar-menu">
-               <button className="sidebar-item" onClick={() => navigate('/')}>🏠 홈으로</button>
-               <button className="sidebar-item" onClick={() => navigate('/schedule')}>📅 내 일정</button>
-               <button className="sidebar-item" onClick={() => navigate('/groups')}>👥 그룹</button>
-               <button className="sidebar-item" onClick={() => navigate('/calendar')}>📆 달력</button>
-               <button className="sidebar-item" onClick={() => navigate('/settings')}>⚙️ 설정</button>
-            </div>
-         </nav>
-         <header className="mobile-header">
-            <div className="mobile-header-content">
-               <div className="mobile-header-left">
-                  <button className="mobile-menu-btn" onClick={() => setIsSidebarOpen(true)}><Menu size={24} /></button>
-                  <div className="mobile-logo-btn" onClick={() => navigate('/')}><div className="mobile-logo-wrapper"><img src="/heyheylogo.png" alt="MeetAgent Logo" className="mobile-logo-img" /><div className={`mobile-login-indicator ${user?.google?.refreshToken ? 'google' : 'local'}`}></div></div><h1 className="mobile-logo-text">MeetAgent</h1></div>
-               </div>
-               <div className="mobile-header-right">
-                  <button className={`mobile-icon-btn ${isClipboardMonitoring ? 'active' : ''}`} onClick={() => setIsClipboardMonitoring(!isClipboardMonitoring)} title="클립보드">{isClipboardMonitoring ? <Clipboard size={18} /> : <ClipboardX size={18} />}</button>
-                  <button className={`mobile-icon-btn ${isBackgroundMonitoring ? 'active' : ''}`} onClick={toggleBackgroundMonitoring} title={isBackgroundMonitoring ? `대화감지 ON ${voiceStatus}` : "대화감지 OFF"}><Phone size={18} /></button>
-                  <button className="mobile-profile-btn" onClick={() => navigate('/settings')} title="설정">{user && user.firstName ? user.firstName : <User size={18} />}</button>
-                  <button className="mobile-logout-btn" onClick={handleLogout} title="로그아웃"><LogOut size={16} /></button>
-               </div>
-            </div>
-         </header>
+        <CalendarHeader
+          user={user}
+          isSidebarOpen={isSidebarOpen}
+          setIsSidebarOpen={setIsSidebarOpen}
+          isClipboardMonitoring={isClipboardMonitoring}
+          setIsClipboardMonitoring={setIsClipboardMonitoring}
+          isBackgroundMonitoring={isBackgroundMonitoring}
+          toggleBackgroundMonitoring={toggleBackgroundMonitoring}
+          voiceStatus={voiceStatus}
+          handleLogout={handleLogout}
+        />
          <div className="schedule-content">
             {isLoading ? (
                <div className="loading-state" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '60vh' }}>
@@ -239,22 +177,14 @@ const MobileCalendarView = ({ user, isClipboardMonitoring, setIsClipboardMonitor
                </div>
             ) :
                <>
-                  <div className="schedule-page-title">
-                     <span>{currentTitle || '달력'}</span>
-                     <div className="top-edit-buttons">
-                        {!isEditing ? (
-                           <>
-                              <button className="edit-button" onClick={handleStartEdit}>편집</button>
-                           </>
-                        ) : (
-                           <>
-                              <button className="edit-button cancel-button" onClick={handleCancel}>취소</button>
-                              <button className="edit-button clear-button" onClick={handleClearAll}>초기화</button>
-                              <button className="edit-button save-button" onClick={handleSave}>저장</button>
-                           </>
-                        )}
-                     </div>
-                  </div>
+                  <EventEditPanel
+                     currentTitle={currentTitle}
+                     isEditing={isEditing}
+                     handleStartEdit={handleStartEdit}
+                     handleCancel={handleCancel}
+                     handleClearAll={handleClearAll}
+                     handleSave={handleSave}
+                  />
                   {googleCalendarEvents.length > 0 && (
                      <div className="calendar-legend">
                         <span className="legend-item">
@@ -267,44 +197,20 @@ const MobileCalendarView = ({ user, isClipboardMonitoring, setIsClipboardMonitor
                         </span>
                      </div>
                   )}
-                  <div
-                     className="calendar-container"
-                     onTouchStart={handleTouchStart}
-                     onTouchMove={handleTouchMove}
-                     onTouchEnd={handleTouchEnd}
-                  >
-                     <div className="pull-indicator top">{translateY > 0 ? '이전 달' : ''}</div>
-                     <div className="pull-indicator bottom">{translateY < 0 ? '다음 달' : ''}</div>
-                     <div className="calendar-wrapper" style={{ transform: `translateY(${translateY}px)`, transition: isSwiping ? 'none' : 'transform 0.3s ease-out', padding: '16px' }}>
-                        <FullCalendar
-                           ref={calendarRef}
-                           plugins={[dayGridPlugin, timeGridPlugin, interactionPlugin]}
-                           initialView="dayGridMonth"
-                           timeZone="local"
-                           headerToolbar={isEditing ? { left: 'backToMonth prev,next', center: 'title', right: 'dayGridMonth,timeGridWeek,timeGridDay' } : false}
-                           customButtons={{ backToMonth: { text: '◀ 월', click: () => calendarRef.current?.getApi().changeView('dayGridMonth') } }}
-                           events={events}
-                           dateClick={handleDateClick}
-                           eventClick={handleEventClick}
-                           eventContent={renderEventContent}
-                           viewDidMount={handleViewChange}
-                           datesSet={handleViewChange}
-                           height="auto"
-                           locale="ko"
-                           buttonText={{ month: '월', week: '주', day: '일' }}
-                           slotMinTime="06:00:00"
-                           slotMaxTime="24:00:00"
-                           allDaySlot={false}
-                           nowIndicator={true}
-                           dayMaxEvents={2}
-                           moreLinkText={(num) => `+${num}개`}
-                           eventDisplay="block"
-                           displayEventTime={false}
-                           navLinks={true}
-                           navLinkDayClick={(date) => calendarRef.current?.getApi().changeView('timeGridDay', date)}
-                        />
-                     </div>
-                  </div>
+                  <CalendarContent
+                    calendarRef={calendarRef}
+                    handleTouchStart={handleTouchStart}
+                    handleTouchMove={handleTouchMove}
+                    handleTouchEnd={handleTouchEnd}
+                    translateY={translateY}
+                    isSwiping={isSwiping}
+                    isEditing={isEditing}
+                    events={events}
+                    handleDateClick={handleDateClick}
+                    handleEventClick={handleEventClick}
+                    renderEventContent={renderEventContent}
+                    handleViewChange={handleViewChange}
+                  />
                   <BottomSection
                      isEditing={isEditing}
                      calendarView={calendarView}

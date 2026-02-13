@@ -6,9 +6,12 @@ const schedulingAlgorithm = require('../services/schedulingAlgorithm');
 const dynamicTravelTimeCalculator = require('../services/dynamicTravelTimeCalculator');
 
 // Constants
-const { ERROR_MESSAGES, HTTP_STATUS } = require('./coordinationSchedulingController/constants/errorMessages');
-const { VALIDATION_RULES, DEFAULTS } = require('./coordinationSchedulingController/constants/validationRules');
-const { VALID_ASSIGNMENT_MODES, SLOT_TYPES } = require('./coordinationSchedulingController/constants/travelModes');
+const { 
+  ERROR_MESSAGES, HTTP_STATUS,
+  VALIDATION_RULES, DEFAULTS,
+  VALID_ASSIGNMENT_MODES, SLOT_TYPES,
+  TRAVEL_MODES, ASSIGNMENT_MODES
+} = require('./coordinationScheduling/constants');
 
 // Validators
 const {
@@ -16,13 +19,12 @@ const {
   validateOwnerSchedule,
   validateMembersSchedule,
   validateAutoConfirmDuration,
-} = require('./coordinationSchedulingController/validators/scheduleValidator');
-const {
+  validateTravelMode,
   validateRoomExists,
   validateOwnerPermission,
   isScheduleConfirmed,
   isConfirmationTimerRunning,
-} = require('./coordinationSchedulingController/validators/roomPermissionValidator');
+} = require('./coordinationScheduling/validators');
 
 // Helpers
 const {
@@ -33,23 +35,36 @@ const {
   updateRoomSettings,
   getMembersOnly,
   getMemberIds,
-  getExistingCarryOvers,
-  cancelConfirmationTimer,
-  setConfirmationTimer,
-} = require('./coordinationSchedulingController/helpers/roomHelper');
-const { shouldPreserveSlot, filterAutoAssignedSlots, filterNonTravelSlots } = require('./coordinationSchedulingController/utils/slotUtils');
+  shouldPreserveSlot,
+  filterAutoAssignedSlots,
+  filterNonTravelSlots,
+  groupSlotsByUserAndDate,
+  mergeSlotsByDate,
+  extractUserId,
+  mergeConsecutiveSlots,
+} = require('./coordinationScheduling/helpers');
+
+// Timer Service
+const { setConfirmationTimer, cancelConfirmationTimer } = require('./coordinationScheduling/timerService');
+
+// Carry Over Service
+const { checkLongTermCarryOvers, getExistingCarryOvers } = require('./coordinationScheduling/carryOverService');
+
 
 // Services
 const {
   runAutoScheduling,
-  checkLongTermCarryOvers,
   applySchedulingResult,
-} = require('./coordinationSchedulingController/services/autoScheduleService');
+} = require('./coordinationScheduling/schedulingService');
 const { confirmSlotsToPersonalCalendar } = require('./coordinationSchedulingController/services/scheduleConfirmService');
 const {
-  applyTravelModeToRoom,
-  confirmTravelModeForRoom,
-} = require('./coordinationSchedulingController/services/travelModeService');
+  applyTravelMode,
+  confirmTravelMode,
+  validateScheduleWithTransportMode,
+} = require('./coordinationScheduling/travelModeService');
+
+// Schedule Confirmation Service
+const { confirmSlotsToPersonalCalendar, saveUserWithRetry } = require('./coordinationSchedulingController/services/scheduleConfirmService');
 
 // @desc    Run auto-schedule algorithm for the room
 // @route   POST /api/coordination/rooms/:roomId/auto-schedule
@@ -114,7 +129,7 @@ exports.runAutoSchedule = async (req, res) => {
       });
     }
 
-    // 이월 정보 수집
+    // 이월 정보 수집 (carryOverService 사용)
     const existingCarryOvers = getExistingCarryOvers(room.members, startDate);
 
     // 🔍 사전 선호시간 체크 (skipConfirmation이 false일 때만)
@@ -230,34 +245,8 @@ exports.runAutoSchedule = async (req, res) => {
       });
     }
 
-    // 장기 이월 확인
-    const twoWeeksAgo = new Date(startDate);
-    twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
-    const oneWeekAgo = new Date(startDate);
-    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-
-    const conflictSuggestions = [];
-
-    for (const member of room.members) {
-      const memberUser = await User.findById(member.user);
-      if (member.carryOver > 0) {
-        const history = member.carryOverHistory || [];
-
-        const hasConsecutiveCarryOver = history.some(h =>
-          new Date(h.week).getTime() >= twoWeeksAgo.getTime() &&
-          new Date(h.week).getTime() < oneWeekAgo.getTime() &&
-          h.amount > 0
-        );
-
-        if (hasConsecutiveCarryOver) {
-          const memberName = memberUser.name || `${memberUser.firstName} ${memberUser.lastName}`;
-          conflictSuggestions.push({
-            title: '장기 이월 멤버 발생',
-            content: `멤버 '${memberName}'의 시간이 2주 이상 연속으로 이월되었습니다. 최소 할당 시간을 줄이거나, 멤버의 참여 가능 시간을 늘리거나, 직접 시간을 할당하여 문제를 해결해야 합니다.`
-          });
-        }
-      }
-    }
+    // 장기 이월 확인 (carryOverService 사용)
+    const conflictSuggestions = await checkLongTermCarryOvers(room.members, startDate);
 
     // 슬롯을 room.timeSlots에 직접 추가
     const addedSlots = new Set();
@@ -368,10 +357,9 @@ exports.runAutoSchedule = async (req, res) => {
       }
     });
 
-    // 자동 확정 타이머 설정
-    const autoConfirmDurationMinutes = room.autoConfirmDuration || 5;
-    const autoConfirmDelay = autoConfirmDurationMinutes * 60 * 1000;
-    room.autoConfirmAt = new Date(Date.now() + autoConfirmDelay);
+    // 자동 확정 타이머 설정 (timerService 사용)
+    const autoConfirmDurationMinutes = room.autoConfirmDuration || DEFAULTS.AUTO_CONFIRM_DURATION_HOURS; // DEFAULTS에서 가져오도록 수정
+    setConfirmationTimer(room, autoConfirmDurationMinutes); // timerService의 setConfirmationTimer 사용
 
     // 자동배정은 항상 normal 모드로 실행
     room.currentTravelMode = 'normal';
@@ -432,31 +420,6 @@ exports.runAutoSchedule = async (req, res) => {
 // @route   DELETE /api/coordination/rooms/:roomId/slots
 // @access  Private (Room Owner only)
 exports.deleteAllTimeSlots = exports.deleteAllTimeSlots = async (req, res) => {
-  // Retry 헬퍼 함수 (VersionError 처리)
-  const saveWithRetry = async (doc, maxRetries = 3) => {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        await doc.save();
-        return;
-      } catch (error) {
-        if (error.name === 'VersionError' && attempt < maxRetries) {
-          // 최신 버전 다시 불러오기
-          const Model = doc.constructor;
-          const fresh = await Model.findById(doc._id);
-          if (fresh) {
-            // 변경사항 재적용
-            if (doc.personalTimes !== undefined) fresh.personalTimes = doc.personalTimes;
-            if (doc.defaultSchedule !== undefined) fresh.defaultSchedule = doc.defaultSchedule;
-            if (doc.deletedPreferencesByRoom !== undefined) fresh.deletedPreferencesByRoom = doc.deletedPreferencesByRoom;
-            doc = fresh;
-          }
-        } else {
-          throw error;
-        }
-      }
-    }
-  };
-
   try {
     const { roomId } = req.params;
     const room = await Room.findById(roomId)
@@ -474,8 +437,8 @@ exports.deleteAllTimeSlots = exports.deleteAllTimeSlots = async (req, res) => {
     // Clear the timeSlots array
     room.timeSlots = [];
 
-    // 자동 확정 타이머 해제 (전체 비우기)
-    room.autoConfirmAt = null;
+    // 자동 확정 타이머 해제 (timerService의 cancelConfirmationTimer 사용)
+    cancelConfirmationTimer(room);
 
     // 확정된 이동수단 모드 초기화
     room.confirmedTravelMode = null;
@@ -539,7 +502,7 @@ exports.deleteAllTimeSlots = exports.deleteAllTimeSlots = async (req, res) => {
           }
         }
 
-        updatePromises.push(saveWithRetry(memberUser));
+        updatePromises.push(saveUserWithRetry(memberUser));
       }
     }
 
@@ -587,7 +550,7 @@ exports.deleteAllTimeSlots = exports.deleteAllTimeSlots = async (req, res) => {
         }
       }
 
-      updatePromises.push(saveWithRetry(owner));
+      updatePromises.push(saveUserWithRetry(owner));
     }
 
     await Promise.all(updatePromises);
@@ -1116,7 +1079,7 @@ exports.startConfirmationTimer = async (req, res) => {
 
     validateAutoConfirmDuration(hours);
 
-    setConfirmationTimer(room, hours);
+    setConfirmationTimer(room, hours); // timerService의 setConfirmationTimer 사용
     await room.save();
 
     res.json({
@@ -1136,284 +1099,9 @@ exports.startConfirmationTimer = async (req, res) => {
   }
 };
 
-// @desc    Apply travel mode
-// @route   POST /api/coordination/rooms/:roomId/apply-travel-mode
-// @access  Private (Room Owner only)
-exports.applyTravelMode = exports.applyTravelMode = async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const { travelMode, enhancedSchedule } = req.body;
 
-    // 방 조회
-    const room = await Room.findById(roomId).populate('members', 'name email').populate('owner', 'name email');
-    if (!room) {
-      return res.status(404).json({ msg: '방을 찾을 수 없습니다.' });
-    }
 
-    // 방장 권한 확인
-    if (!room.owner._id.equals(req.user.id)) {
-      return res.status(403).json({ msg: '방장만 이동시간 모드를 변경할 수 있습니다.' });
-    }
 
-    // 이미 확정된 스케줄인지 확인
-    if (room.confirmedAt) {
-      return res.status(400).json({
-        msg: '이미 확정된 스케줄입니다. 확정 이후에는 이동시간 모드를 변경할 수 없습니다.',
-        confirmedAt: room.confirmedAt
-      });
-    }
-
-    // enhancedSchedule 검증
-    const receivedTimeSlots = enhancedSchedule?.timeSlots || (Array.isArray(enhancedSchedule) ? enhancedSchedule : null);
-    const receivedTravelSlots = enhancedSchedule?.travelSlots || [];
-    
-    if (!receivedTimeSlots || !Array.isArray(receivedTimeSlots)) {
-      return res.status(400).json({ 
-        msg: 'enhancedSchedule.timeSlots이 필요합니다.',
-        received: typeof enhancedSchedule,
-        hasTimeSlots: !!enhancedSchedule?.timeSlots
-      });
-    }
-
-    // timeSlots 업데이트
-    if (travelMode === 'normal') {
-      // 일반 모드로 복원
-      if (room.originalTimeSlots && room.originalTimeSlots.length > 0) {
-        room.timeSlots = room.originalTimeSlots;
-        room.originalTimeSlots = [];
-      }
-      room.travelTimeSlots = [];
-    } else {
-      // 이동시간 모드
-
-      // 원본 저장 (첫 적용 시에만)
-      if (!room.originalTimeSlots || room.originalTimeSlots.length === 0) {
-        room.originalTimeSlots = JSON.parse(JSON.stringify(room.timeSlots));
-      }
-
-      // 이동시간 슬롯을 travelTimeSlots에 저장
-      room.travelTimeSlots = receivedTravelSlots.map(e => {
-        const dateObj = e.date instanceof Date ? e.date : new Date(e.date);
-        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-        const dayOfWeek = dayNames[dateObj.getDay()];
-        const userId = e.user?._id || e.user || room.owner._id;
-        let userColor = e.color;
-        if (!userColor) {
-          userColor = room.getUserColor(userId);
-        }
-        
-        return {
-          user: userId,
-          date: dateObj,
-          day: e.day || dayOfWeek,
-          startTime: e.startTime,
-          endTime: e.endTime,
-          subject: '이동시간',
-          type: 'travel',
-          color: userColor,
-          from: e.from,
-          to: e.to,
-          travelMode: e.travelMode || travelMode,
-          travelInfo: e.travelInfo
-        };
-      });
-
-      // 수업시간 슬롯만 저장 (이동시간 제외)
-      const classTimeSlots = receivedTimeSlots.filter(e => !e.isTravel && e.subject !== '이동시간');
-      
-      // 연속된 슬롯 병합
-      const mergeConsecutiveSlots = (slots) => {
-        if (slots.length === 0) return [];
-        
-        const sorted = [...slots].sort((a, b) => {
-          const dateCompare = new Date(a.date) - new Date(b.date);
-          if (dateCompare !== 0) return dateCompare;
-          const userA = (a.user._id || a.user).toString();
-          const userB = (b.user._id || b.user).toString();
-          const userCompare = userA.localeCompare(userB);
-          if (userCompare !== 0) return userCompare;
-          return a.startTime.localeCompare(b.startTime);
-        });
-        
-        const merged = [];
-        let current = { ...sorted[0] };
-        
-        for (let i = 1; i < sorted.length; i++) {
-          const next = sorted[i];
-          const currentUserId = (current.user._id || current.user).toString();
-          const nextUserId = (next.user._id || next.user).toString();
-          const currentDate = new Date(current.date).toISOString().split('T')[0];
-          const nextDate = new Date(next.date).toISOString().split('T')[0];
-          
-          if (
-            currentUserId === nextUserId &&
-            currentDate === nextDate &&
-            current.subject === next.subject &&
-            current.endTime === next.startTime
-          ) {
-            current.endTime = next.endTime;
-            if (next.originalEndTime) {
-              current.originalEndTime = next.originalEndTime;
-            }
-          } else {
-            merged.push(current);
-            current = { ...next };
-          }
-        }
-        merged.push(current);
-        return merged;
-      };
-      
-      const mergedSlots = mergeConsecutiveSlots(classTimeSlots);
-      
-      // 병합된 슬롯을 DB 형식으로 변환
-      room.timeSlots = mergedSlots.map(e => {
-        return {
-          user: e.user._id || e.user,
-          date: e.date instanceof Date ? e.date : new Date(e.date),
-          day: e.day,
-          startTime: e.startTime,
-          endTime: e.endTime,
-          subject: e.subject || '자동 배정',
-          assignedBy: room.owner._id,
-          status: 'confirmed',
-          adjustedForTravelTime: e.adjustedForTravelTime || false,
-          originalStartTime: e.originalStartTime,
-          originalEndTime: e.originalEndTime,
-          actualStartTime: e.actualStartTime,
-          travelTimeBefore: e.travelTimeBefore
-        };
-      });
-    }
-
-    // 금지시간 검증
-    if (travelMode !== 'normal') {
-      const blockedTimes = room.settings?.blockedTimes || [];
-
-      if (blockedTimes.length > 0) {
-        const timeToMinutes = (timeStr) => {
-          const [hours, minutes] = timeStr.split(':').map(Number);
-          return hours * 60 + minutes;
-        };
-
-        const minutesToTime = (minutes) => {
-          const hours = Math.floor(minutes / 60);
-          const mins = minutes % 60;
-          return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
-        };
-
-        const isTimeInBlockedRange = (startTime, endTime, blockedTimes) => {
-          const start = timeToMinutes(startTime);
-          const end = timeToMinutes(endTime);
-          
-          for (const blocked of blockedTimes) {
-            const blockedStart = timeToMinutes(blocked.startTime);
-            const blockedEnd = timeToMinutes(blocked.endTime);
-            
-            if (start < blockedEnd && end > blockedStart) {
-              return blocked;
-            }
-          }
-          return null;
-        };
-
-        room.timeSlots.forEach(slot => {
-          if (slot.adjustedForTravelTime) {
-            const blockedTime = isTimeInBlockedRange(slot.startTime, slot.endTime, blockedTimes);
-
-            if (blockedTime) {
-              const blockedEndMinutes = timeToMinutes(blockedTime.endTime);
-              const slotDuration = timeToMinutes(slot.endTime) - timeToMinutes(slot.startTime);
-              const newStartMinutes = blockedEndMinutes;
-              const newEndMinutes = blockedEndMinutes + slotDuration;
-
-              slot.startTime = minutesToTime(newStartMinutes);
-              slot.endTime = minutesToTime(newEndMinutes);
-            }
-          }
-        });
-      }
-    }
-
-    // currentTravelMode 설정
-    room.currentTravelMode = travelMode;
-
-    // VersionError 처리하면서 저장
-    const maxRetries = 3;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        await room.save();
-        break;
-      } catch (error) {
-        if (error.name === 'VersionError' && attempt < maxRetries) {
-          const freshRoom = await Room.findById(room._id);
-          if (freshRoom) {
-            freshRoom.timeSlots = room.timeSlots;
-            freshRoom.originalTimeSlots = room.originalTimeSlots;
-            freshRoom.travelTimeSlots = room.travelTimeSlots;
-            freshRoom.currentTravelMode = room.currentTravelMode;
-            room = freshRoom;
-          }
-        } else {
-          throw error;
-        }
-      }
-    }
-
-    // Socket.io 이벤트
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`room-${roomId}`).emit('travelModeChanged', {
-        roomId: room._id.toString(),
-        travelMode: travelMode,
-        timeSlots: room.timeSlots,
-        currentTravelMode: room.currentTravelMode
-      });
-    }
-
-    res.json({
-      success: true,
-      travelMode: travelMode,
-      timeSlotsCount: room.timeSlots.length
-    });
-
-  } catch (error) {
-    console.error('applyTravelMode error:', error);
-    res.status(500).json({ msg: '서버 오류가 발생했습니다.', error: error.message });
-  }
-};;
-
-// @desc    Confirm travel mode
-// @route   POST /api/coordination/rooms/:roomId/confirm-travel-mode
-// @access  Private (Room Owner only)
-exports.confirmTravelMode = async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const { travelMode } = req.body;
-
-    const room = await getRoomById(roomId);
-    if (!validateRoomExists(room, res)) return;
-    if (!validateOwnerPermission(room, req.user.id, res)) return;
-
-    const { previousMode, currentMode } = await confirmTravelModeForRoom(room, travelMode);
-
-    res.json({
-      success: true,
-      msg: `${currentMode} 모드가 확정되었습니다.`,
-      data: {
-        previousMode,
-        currentMode,
-        confirmedTravelMode: room.confirmedTravelMode
-      }
-    });
-
-  } catch (error) {
-    res.status(HTTP_STATUS.INTERNAL_ERROR).json({
-      msg: '이동 모드 확정 중 오류가 발생했습니다.',
-      error: error.message
-    });
-  }
-};
 
 // @desc    Set auto confirm duration
 // @route   POST /api/coordination/rooms/:roomId/auto-confirm-duration
@@ -1429,7 +1117,7 @@ exports.setAutoConfirmDuration = async (req, res) => {
 
     validateAutoConfirmDuration(hours);
 
-    setConfirmationTimer(room, hours);
+    setConfirmationTimer(room, hours); // timerService의 setConfirmationTimer 사용
     await room.save();
 
     res.json({
@@ -1449,295 +1137,3 @@ exports.setAutoConfirmDuration = async (req, res) => {
   }
 };
 
-// @desc    Validate schedule with transport mode
-// @route   POST /api/coordination/rooms/:roomId/validate-transport-mode
-// @access  Private (Room Owner only)
-exports.validateScheduleWithTransportMode = exports.validateScheduleWithTransportMode = async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const { transportMode, viewMode, weekStartDate } = req.body;
-
-    // 방 조회
-    const room = await Room.findById(roomId)
-      .populate('owner', 'firstName lastName email defaultSchedule scheduleExceptions personalTimes priority address addressLat addressLng')
-      .populate('members.user', 'firstName lastName email defaultSchedule scheduleExceptions personalTimes priority address addressLat addressLng');
-
-    if (!room) {
-      return res.status(404).json({ msg: '방을 찾을 수 없습니다.' });
-    }
-
-    // 방장 권한 확인
-    if (!room.isOwner(req.user.id)) {
-      return res.status(403).json({ msg: '방장만 이 기능을 사용할 수 있습니다.' });
-    }
-
-    // 현재 스케줄 확인 (자동배정된 슬롯만)
-    let autoAssignedSlots = room.timeSlots.filter(slot =>
-      slot.assignedBy && slot.status === 'confirmed' && !slot.isTravel
-    );
-
-    // viewMode에 따라 슬롯 필터링
-    if (viewMode === 'week' && weekStartDate) {
-      const weekStart = new Date(weekStartDate);
-      const weekEnd = new Date(weekStart);
-      weekEnd.setDate(weekEnd.getDate() + 7);
-      autoAssignedSlots = autoAssignedSlots.filter(slot => {
-        const slotDate = new Date(slot.date);
-        return slotDate >= weekStart && slotDate < weekEnd;
-      });
-    }
-
-    if (autoAssignedSlots.length === 0) {
-      return res.status(400).json({ 
-        success: false,
-        msg: '검증할 스케줄이 없습니다. 먼저 자동배정을 실행하세요.' 
-      });
-    }
-
-    // 일반 모드면 항상 검증 성공
-    if (transportMode === 'normal') {
-      return res.json({
-        success: true,
-        isValid: true,
-        transportMode: 'normal',
-        warnings: [],
-        msg: '일반 모드는 항상 유효합니다.'
-      });
-    }
-
-    // 이동시간 모드 검증
-    const warnings = [];
-    const membersOnly = room.members.filter(m => {
-      const memberId = m.user._id ? m.user._id.toString() : m.user.toString();
-      const ownerId = room.owner._id ? room.owner._id.toString() : room.owner.toString();
-      return memberId !== ownerId;
-    });
-
-    const ownerLocation = {
-      lat: room.owner.addressLat,
-      lng: room.owner.addressLng,
-      address: room.owner.address
-    };
-
-    // 방장 위치 정보 확인
-    if (!ownerLocation.lat || !ownerLocation.lng) {
-      return res.status(400).json({
-        success: false,
-        msg: '방장의 주소 정보가 없습니다. 프로필에서 주소를 설정해주세요.'
-      });
-    }
-
-    // 각 멤버별로 검증
-    for (const member of membersOnly) {
-      const memberUser = member.user;
-      const memberId = memberUser._id.toString();
-      const memberName = `${memberUser.firstName} ${memberUser.lastName}`;
-
-      // 멤버의 위치 정보 확인
-      if (!memberUser.addressLat || !memberUser.addressLng) {
-        warnings.push({
-          type: 'no_address',
-          memberId: memberId,
-          memberName: memberName,
-          reason: '주소 정보 없음'
-        });
-        continue;
-      }
-
-      // 이 멤버에게 배정된 슬롯들
-      const memberSlots = autoAssignedSlots.filter(slot => 
-        slot.user.toString() === memberId
-      );
-
-      if (memberSlots.length === 0) {
-        warnings.push({
-          type: 'not_assigned',
-          memberId: memberId,
-          memberName: memberName,
-          reason: '스케줄에 배정되지 않음'
-        });
-        continue;
-      }
-
-      // 이동시간 계산
-      const memberLocation = {
-        coordinates: {
-          lat: memberUser.addressLat,
-          lng: memberUser.addressLng
-        },
-        address: memberUser.address
-      };
-
-      const ownerLocationFormatted = {
-        coordinates: {
-          lat: ownerLocation.lat,
-          lng: ownerLocation.lng
-        },
-        address: ownerLocation.address
-      };
-
-      let travelTimeMinutes = 0;
-      try {
-        travelTimeMinutes = await dynamicTravelTimeCalculator.calculateTravelTimeBetween(
-          memberLocation,
-          ownerLocationFormatted,
-          transportMode
-        );
-      } catch (error) {
-        warnings.push({
-          type: 'travel_time_error',
-          memberId: memberId,
-          memberName: memberName,
-          reason: '이동시간 계산 실패'
-        });
-        continue;
-      }
-
-      const dayTranslation = {
-        'monday': '월요일',
-        'tuesday': '화요일',
-        'wednesday': '수요일',
-        'thursday': '목요일',
-        'friday': '금요일',
-        'saturday': '토요일',
-        'sunday': '일요일'
-      };
-
-      const dayOfWeekMap = {
-        'sunday': 0,
-        'monday': 1,
-        'tuesday': 2,
-        'wednesday': 3,
-        'thursday': 4,
-        'friday': 5,
-        'saturday': 6
-      };
-
-      const timeToMinutes = (timeStr) => {
-        const [hours, minutes] = timeStr.split(':').map(Number);
-        return hours * 60 + minutes;
-      };
-
-      // 요일별로 슬롯 그룹화
-      const slotsByDay = {};
-      memberSlots.forEach(slot => {
-        if (!slotsByDay[slot.day]) {
-          slotsByDay[slot.day] = [];
-        }
-        slotsByDay[slot.day].push(slot);
-      });
-
-      // 각 요일별로 검증
-      for (const [dayEn, daySlots] of Object.entries(slotsByDay)) {
-        const dayKo = dayTranslation[dayEn] || dayEn;
-        
-        // 이 요일의 총 수업시간 계산
-        let totalClassMinutes = 0;
-        daySlots.forEach(slot => {
-          const duration = timeToMinutes(slot.endTime) - timeToMinutes(slot.startTime);
-          totalClassMinutes += duration;
-        });
-
-        // 총 필요시간 = 이동시간 + 수업시간
-        const totalRequiredMinutes = travelTimeMinutes + totalClassMinutes;
-
-        const targetDayOfWeek = dayOfWeekMap[dayEn];
-        
-        // 해당 요일의 실제 날짜 찾기
-        let targetDate = null;
-        daySlots.forEach(slot => {
-          if (!targetDate) {
-            targetDate = new Date(slot.date);
-          }
-        });
-
-        const preferredSchedules = (memberUser.defaultSchedule || []).filter(s => {
-          if (s.specificDate) {
-            const scheduleDate = new Date(s.specificDate);
-            const targetDateStr = targetDate ? targetDate.toISOString().split('T')[0] : null;
-            const scheduleDateStr = scheduleDate.toISOString().split('T')[0];
-            return scheduleDateStr === targetDateStr;
-          }
-          return s.dayOfWeek === targetDayOfWeek || s.day === dayEn;
-        });
-        
-        if (preferredSchedules.length === 0) {
-          warnings.push({
-            type: 'no_preference_for_day',
-            memberId: memberId,
-            memberName: memberName,
-            day: dayKo,
-            dayEn: dayEn,
-            reason: `${dayKo}에 선호시간 없음`
-          });
-          continue;
-        }
-
-        // 겹치는 시간대를 머지해서 총 가용시간 계산
-        const mergedIntervals = [];
-        const sortedPrefs = preferredSchedules
-          .map(pref => ({
-            start: timeToMinutes(pref.startTime),
-            end: timeToMinutes(pref.endTime)
-          }))
-          .sort((a, b) => a.start - b.start);
-
-        for (const interval of sortedPrefs) {
-          if (mergedIntervals.length === 0 || mergedIntervals[mergedIntervals.length - 1].end < interval.start) {
-            mergedIntervals.push({ start: interval.start, end: interval.end });
-          } else {
-            mergedIntervals[mergedIntervals.length - 1].end = Math.max(
-              mergedIntervals[mergedIntervals.length - 1].end,
-              interval.end
-            );
-          }
-        }
-
-        // 선호시간 총합 계산
-        let totalAvailableMinutes = 0;
-        mergedIntervals.forEach(interval => {
-          totalAvailableMinutes += (interval.end - interval.start);
-        });
-
-        // 검증: 필요시간 <= 선호시간
-        if (totalRequiredMinutes > totalAvailableMinutes) {
-          warnings.push({
-            type: 'insufficient_preference',
-            memberId: memberId,
-            memberName: memberName,
-            day: dayKo,
-            dayEn: dayEn,
-            requiredMinutes: totalRequiredMinutes,
-            availableMinutes: totalAvailableMinutes,
-            travelMinutes: travelTimeMinutes,
-            classMinutes: totalClassMinutes,
-            reason: `${dayKo} 선호시간 부족 (필요 ${totalRequiredMinutes}분, 가용 ${totalAvailableMinutes}분)`
-          });
-        }
-      }
-    }
-
-    // 결과 반환
-    const isValid = warnings.length === 0;
-
-    res.json({
-      success: true,
-      isValid: isValid,
-      transportMode: transportMode,
-      warnings: warnings,
-      msg: isValid 
-        ? `${transportMode} 모드로 스케줄이 유효합니다.`
-        : `${transportMode} 모드로 스케줄 검증에 ${warnings.length}개의 문제가 발견되었습니다.`
-    });
-
-  } catch (error) {
-    console.error('validateScheduleWithTransportMode error:', error);
-    res.status(500).json({ 
-      success: false,
-      msg: '서버 오류가 발생했습니다.', 
-      error: error.message 
-    });
-  }
-};;
-
-module.exports = exports;
