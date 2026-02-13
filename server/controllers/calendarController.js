@@ -1,0 +1,1015 @@
+const { google } = require('googleapis');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const User = require('../models/user');
+const Event = require('../models/event');
+const ScheduleSuggestion = require('../models/ScheduleSuggestion');
+const RejectedSuggestion = require('../models/RejectedSuggestion');
+const Message = require('../models/ChatMessage');
+const { deleteFromGoogleCalendar } = require('../services/confirmScheduleService');
+const multer = require('multer');
+
+// Gemini AI 초기화
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Access Token 갱신 함수
+const updateAccessToken = async (user) => {
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
+  );
+
+  oauth2Client.setCredentials({
+    refresh_token: user.google.refreshToken,
+  });
+
+  try {
+    const { credentials } = await oauth2Client.refreshAccessToken();
+    user.google.accessToken = credentials.access_token;
+    if (credentials.refresh_token) {
+      user.google.refreshToken = credentials.refresh_token;
+    }
+    await user.save();
+    return oauth2Client;
+  } catch (error) {
+    throw new Error('Access Token 갱신에 실패했습니다. 다시 로그인해주세요.');
+  }
+};
+
+exports.getCalendarEvents = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user || !user.google || !user.google.refreshToken) {
+      return res.status(401).json({ msg: 'Google 계정이 연결되지 않았거나 토큰이 없습니다.' });
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+    oauth2Client.setCredentials({
+      access_token: user.google.accessToken,
+      refresh_token: user.google.refreshToken,
+    });
+
+    // 토큰 갱신 이벤트 처리
+    oauth2Client.on('tokens', async (tokens) => {
+      user.google.accessToken = tokens.access_token;
+      if (tokens.refresh_token) {
+        user.google.refreshToken = tokens.refresh_token;
+      }
+      await user.save();
+    });
+
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    const { timeMin, timeMax } = req.query;
+
+    const response = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: timeMin || (new Date()).toISOString(),
+      timeMax: timeMax,
+      maxResults: 250,
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+
+    // 🆕 extendedProperties 포함하여 반환 (중복 필터링용)
+    const events = response.data.items.map(event => ({
+      ...event,
+      extendedProperties: event.extendedProperties || null
+    }));
+    res.json(events);
+
+  } catch (error) {
+    console.error('getCalendarEvents error:', error.message);
+    res.status(500).json({ msg: '캘린더 이벤트를 가져오는 데 실패했습니다.' });
+  }
+};
+
+exports.createGoogleCalendarEvent = async (req, res) => {
+  try {
+    console.log('[createGoogleCalendarEvent] 요청 받음:', req.body);
+    const user = await User.findById(req.user.id);
+    if (!user || !user.google || !user.google.refreshToken) {
+      return res.status(401).json({ msg: 'Google 계정이 연결되지 않았거나 토큰이 없습니다.' });
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+    oauth2Client.setCredentials({
+      refresh_token: user.google.refreshToken,
+    });
+
+    // 수동 토큰 갱신 (on('tokens') 콜백은 user.save() 경쟁 조건 유발하므로 사용 안 함)
+    try {
+      const { credentials } = await oauth2Client.refreshAccessToken();
+      oauth2Client.setCredentials(credentials);
+      // 토큰 업데이트를 별도로 저장 (googleEventId 저장과 분리)
+      await User.updateOne({ _id: req.user.id }, {
+        'google.accessToken': credentials.access_token,
+        ...(credentials.refresh_token ? { 'google.refreshToken': credentials.refresh_token } : {})
+      });
+    } catch (tokenErr) {
+      console.warn('[createGoogleCalendarEvent] 토큰 갱신 실패, 기존 토큰 사용');
+      oauth2Client.setCredentials({
+        access_token: user.google.accessToken,
+        refresh_token: user.google.refreshToken,
+      });
+    }
+
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    const { title, description, startDateTime, endDateTime, location, participantsCount, externalParticipants } = req.body;
+
+    const event = {
+      summary: title,
+      description: description,
+      location: location || '',
+      start: {
+        dateTime: startDateTime,
+        timeZone: 'Asia/Seoul',
+      },
+      end: {
+        dateTime: endDateTime,
+        timeZone: 'Asia/Seoul',
+      },
+      extendedProperties: {
+        private: {
+          source: 'meetagent',
+          participantsCount: String(participantsCount || 1),
+          externalParticipants: JSON.stringify(externalParticipants || [])
+        }
+      }
+    };
+
+    const response = await calendar.events.insert({
+      calendarId: 'primary',
+      resource: event,
+    });
+
+    console.log('[createGoogleCalendarEvent] ✅ 구글 캘린더 생성 성공:', response.data.id, response.data.summary);
+
+    // 생성된 googleEventId를 personalTimes에 저장 (역동기화 추적용)
+    try {
+      const startDate = new Date(startDateTime);
+      const specificDate = startDate.toISOString().split('T')[0];
+      const startTimeStr = `${String(startDate.getHours()).padStart(2, '0')}:${String(startDate.getMinutes()).padStart(2, '0')}`;
+
+      // User.updateOne으로 직접 업데이트 (user.save() 충돌 방지)
+      const updateResult = await User.updateOne(
+        {
+          _id: req.user.id,
+          'personalTimes.specificDate': specificDate,
+          'personalTimes.startTime': startTimeStr,
+          'personalTimes.title': title,
+          'personalTimes.googleEventId': { $exists: false }
+        },
+        { $set: { 'personalTimes.$.googleEventId': response.data.id } }
+      );
+
+      if (updateResult.modifiedCount > 0) {
+        console.log('[createGoogleCalendarEvent] ✅ googleEventId 저장:', response.data.id, '→', title);
+      } else {
+        // googleEventId가 null인 경우도 시도
+        const updateResult2 = await User.updateOne(
+          {
+            _id: req.user.id,
+            'personalTimes.specificDate': specificDate,
+            'personalTimes.startTime': startTimeStr,
+            'personalTimes.title': title,
+            'personalTimes.googleEventId': null
+          },
+          { $set: { 'personalTimes.$.googleEventId': response.data.id } }
+        );
+        if (updateResult2.modifiedCount > 0) {
+          console.log('[createGoogleCalendarEvent] ✅ googleEventId 저장 (null→id):', response.data.id, '→', title);
+        } else {
+          console.log('[createGoogleCalendarEvent] ⚠️ 매칭되는 personalTime 없음 (title:', title, 'date:', specificDate, 'time:', startTimeStr, ')');
+        }
+      }
+    } catch (saveErr) {
+      console.warn('[createGoogleCalendarEvent] googleEventId 저장 실패:', saveErr.message);
+    }
+
+    res.status(201).json(response.data);
+
+  } catch (error) {
+    console.error('createGoogleCalendarEvent error:', error.message);
+    res.status(500).json({ msg: 'Google 캘린더 이벤트를 생성하는 데 실패했습니다.' });
+  }
+};
+
+exports.deleteGoogleCalendarEvent = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const user = await User.findById(req.user.id);
+    if (!user || !user.google || !user.google.refreshToken) {
+      return res.status(401).json({ msg: 'Google 계정이 연결되지 않았거나 토큰이 없습니다.' });
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+    oauth2Client.setCredentials({
+      access_token: user.google.accessToken,
+      refresh_token: user.google.refreshToken,
+    });
+
+    // 토큰 새로고침 핸들러
+    oauth2Client.on('tokens', async (tokens) => {
+      try {
+        if (tokens.access_token) {
+          user.google.accessToken = tokens.access_token;
+        }
+        if (tokens.refresh_token) {
+          user.google.refreshToken = tokens.refresh_token;
+        }
+        await user.save();
+      } catch (tokenSaveErr) {
+        // 토큰 저장 실패 무시
+      }
+    });
+
+    // 토큰이 만료되었을 수 있으므로 강제 새로고침 시도
+    try {
+      const { credentials } = await oauth2Client.refreshAccessToken();
+      oauth2Client.setCredentials(credentials);
+    } catch (refreshErr) {
+      // 기존 토큰으로 시도
+    }
+
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    // google- 접두사가 있으면 제거
+    let cleanEventId = eventId;
+    if (eventId.startsWith('google-')) {
+      cleanEventId = eventId.replace('google-', '');
+    }
+
+    // 🆕 삭제 전에 이벤트 정보 조회 (조율방 확정 일정인지 확인)
+    let roomId = null;
+    let suggestionId = null;
+    let eventTitle = null;
+    try {
+      const eventInfo = await calendar.events.get({
+        calendarId: 'primary',
+        eventId: cleanEventId,
+      });
+      roomId = eventInfo.data.extendedProperties?.private?.roomId;
+      suggestionId = eventInfo.data.extendedProperties?.private?.suggestionId;
+      eventTitle = eventInfo.data.summary;
+      console.log('[deleteGoogleCalendarEvent] roomId:', roomId, 'suggestionId:', suggestionId, 'title:', eventTitle);
+    } catch (getErr) {
+      console.warn('[deleteGoogleCalendarEvent] 이벤트 정보 조회 실패:', getErr.message);
+    }
+
+    await calendar.events.delete({
+      calendarId: 'primary',
+      eventId: cleanEventId,
+    });
+
+    // 🆕 조율방 확정 일정이면 불참 처리 및 알림
+    if (suggestionId || roomId) {
+      try {
+        const userName = `${user.firstName || ''} ${user.lastName || ''}`.trim() || '사용자';
+
+        // ScheduleSuggestion에서 해당 사용자를 불참 처리 (suggestionId 우선)
+        let suggestion = null;
+        if (suggestionId) {
+          suggestion = await ScheduleSuggestion.findById(suggestionId);
+        }
+        if (!suggestion && roomId) {
+          suggestion = await ScheduleSuggestion.findOne({
+            room: roomId,
+            status: { $in: ['future', 'today', 'pending'] }
+          });
+        }
+
+        if (suggestion) {
+          const memberResponse = suggestion.memberResponses.find(
+            r => (r.user._id?.toString() || r.user.toString()) === user._id.toString()
+          );
+          if (memberResponse && memberResponse.status === 'accepted') {
+            memberResponse.status = 'rejected';
+            memberResponse.respondedAt = new Date();
+            memberResponse.personalTimeId = null;
+            await suggestion.save();
+            console.log(`[deleteGoogleCalendarEvent] ✅ ${userName} 불참 처리 완료 - suggestionId: ${suggestion._id}`);
+
+            // 소켓으로 suggestion 업데이트 알림
+            if (global.io && suggestion.room) {
+              global.io.to(`room-${suggestion.room}`).emit('suggestion-updated', {
+                suggestionId: suggestion._id,
+                suggestion: suggestion
+              });
+            }
+          }
+        }
+
+        // 시스템 메시지 전송 (sender 필수이므로 user._id 사용)
+        if (roomId) {
+          const systemMessage = new Message({
+            room: roomId,
+            sender: user._id,
+            content: `⚠️ ${userName}님이 "${eventTitle || '일정'}"을 삭제하여 불참 처리되었습니다.`,
+            type: 'system'
+          });
+          await systemMessage.save();
+
+          // 소켓으로 실시간 알림
+          if (global.io) {
+            global.io.to(`room-${roomId}`).emit('chat-message', systemMessage);
+          }
+        }
+      } catch (notifyErr) {
+        console.warn('[deleteGoogleCalendarEvent] 조율방 알림 실패:', notifyErr.message);
+      }
+    }
+
+    res.status(204).send();
+
+  } catch (error) {
+    // 404/410 에러인 경우 (이미 삭제됨 또는 존재하지 않음) 성공으로 처리
+    if (error.code === 404 || error.code === 410 || 
+        error.message?.includes('Not Found') || 
+        error.message?.includes('Resource has been deleted')) {
+      return res.status(204).send();
+    }
+    
+    // 403 에러 (권한 없음)
+    if (error.code === 403) {
+      return res.status(403).json({ msg: '이 이벤트를 삭제할 권한이 없습니다.' });
+    }
+    
+    res.status(500).json({ msg: 'Google 캘린더 이벤트를 삭제하는 데 실패했습니다.', error: error.message });
+  }
+};
+
+exports.updateGoogleCalendarEvent = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user || !user.google || !user.google.refreshToken) {
+      return res.status(401).json({ msg: 'Google 계정이 연결되지 않았거나 토큰이 없습니다.' });
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+    oauth2Client.setCredentials({
+      access_token: user.google.accessToken,
+      refresh_token: user.google.refreshToken,
+    });
+
+    oauth2Client.on('tokens', async (tokens) => {
+      user.google.accessToken = tokens.access_token;
+      if (tokens.refresh_token) {
+        user.google.refreshToken = tokens.refresh_token;
+      }
+      await user.save();
+    });
+
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    const { eventId } = req.params;
+    const { title, description, startDateTime, endDateTime, etag } = req.body;
+
+    if (new Date(startDateTime) >= new Date(endDateTime)) {
+      return res.status(400).json({ msg: '종료 시간은 시작 시간보다 늦어야 합니다.' });
+    }
+
+    const event = {
+      summary: title,
+      description: description,
+      start: {
+        dateTime: startDateTime,
+        timeZone: 'Asia/Seoul',
+      },
+      end: {
+        dateTime: endDateTime,
+        timeZone: 'Asia/Seoul',
+      },
+    };
+
+    const response = await calendar.events.update({
+      calendarId: 'primary',
+      eventId: eventId,
+      resource: event,
+      headers: { 'If-Match': etag },
+    });
+
+    res.status(200).json(response.data);
+
+  } catch (error) {
+    console.error('updateGoogleCalendarEvent error:', error.message);
+    res.status(500).json({ msg: 'Google 캘린더 이벤트를 업데이트하는 데 실패했습니다.', error: error.message });
+  }
+};
+
+// @desc    기존 DB 일정을 구글 캘린더로 일괄 동기화
+// @route   POST /api/calendar/sync-to-google
+// @access  Private
+// 핵심 동기화 로직 (서버 내부에서도 직접 호출 가능)
+const syncEventsToGoogleInternal = async (userId) => {
+  const user = await User.findById(userId);
+  console.log('[syncEventsToGoogle] 시작 - userId:', userId);
+  if (!user || !user.google || !user.google.refreshToken) {
+    return { success: false, synced: 0, msg: 'Google 캘린더가 연결되지 않았습니다.' };
+  }
+
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
+  );
+  oauth2Client.setCredentials({
+    refresh_token: user.google.refreshToken,
+  });
+
+  // 수동 토큰 갱신 (on('tokens') 경쟁 조건 방지)
+  try {
+    const { credentials } = await oauth2Client.refreshAccessToken();
+    oauth2Client.setCredentials(credentials);
+    await User.updateOne({ _id: userId }, {
+      'google.accessToken': credentials.access_token,
+      ...(credentials.refresh_token ? { 'google.refreshToken': credentials.refresh_token } : {})
+    });
+  } catch (tokenErr) {
+    console.warn('[syncEventsToGoogle] 토큰 갱신 실패, 기존 토큰 사용');
+    oauth2Client.setCredentials({
+      access_token: user.google.accessToken,
+      refresh_token: user.google.refreshToken,
+    });
+  }
+
+  const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+  const personalTimeEvents = (user.personalTimes || [])
+    .filter(pt => pt.specificDate)
+    .filter(pt => !pt.googleEventId) // 이미 구글에 있는 이벤트는 스킵
+    .map(pt => ({
+      title: pt.title || '개인 일정',
+      description: pt.description || '',
+      location: pt.location || '',
+      startDateTime: `${pt.specificDate}T${pt.startTime}:00+09:00`,
+      endDateTime: `${pt.specificDate}T${pt.endTime}:00+09:00`,
+      suggestionId: pt.suggestionId || null,
+      roomId: pt.roomId || null,
+    }));
+
+  const dbEvents = await Event.find({ userId });
+  const dbEventsMapped = dbEvents.map(ev => ({
+    title: ev.title || '일정',
+    description: ev.description || '',
+    location: ev.location || '',
+    startDateTime: ev.startTime.toISOString(),
+    endDateTime: ev.endTime.toISOString(),
+  }));
+
+  const allEventsToSync = [...personalTimeEvents, ...dbEventsMapped];
+  console.log('[syncEventsToGoogle] 동기화 대상:', allEventsToSync.length, '개');
+
+  if (allEventsToSync.length === 0) {
+    return { success: true, synced: 0, skipped: 0, total: 0, msg: '동기화할 일정이 없습니다.' };
+  }
+
+  const threeMonthsAgo = new Date();
+  threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+  const oneYearLater = new Date();
+  oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
+
+  let existingGoogleEvents = [];
+  try {
+    const existing = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: threeMonthsAgo.toISOString(),
+      timeMax: oneYearLater.toISOString(),
+      maxResults: 2500,
+      singleEvents: true,
+    });
+    existingGoogleEvents = existing.data.items || [];
+  } catch (listErr) {
+    console.warn('기존 구글 캘린더 이벤트 조회 실패:', listErr.message);
+  }
+
+  let syncedCount = 0;
+  let skippedCount = 0;
+
+  for (const ev of allEventsToSync) {
+    try {
+      const evStartPrefix = ev.startDateTime.substring(0, 16);
+      const isDuplicate = existingGoogleEvents.some(ge => {
+        const geStart = ge.start?.dateTime || ge.start?.date || '';
+        return ge.summary === ev.title && geStart.substring(0, 16) === evStartPrefix;
+      });
+
+      if (isDuplicate) {
+        console.log(`[syncEventsToGoogle] 중복 스킵: ${ev.title} (${evStartPrefix})`);
+        skippedCount++;
+        continue;
+      }
+
+      const insertResult = await calendar.events.insert({
+        calendarId: 'primary',
+        resource: {
+          summary: ev.title,
+          description: ev.description,
+          location: ev.location,
+          start: { dateTime: ev.startDateTime, timeZone: 'Asia/Seoul' },
+          end: { dateTime: ev.endDateTime, timeZone: 'Asia/Seoul' },
+          extendedProperties: {
+            private: {
+              source: 'meetagent',
+              ...(ev.suggestionId && { suggestionId: ev.suggestionId }),
+              ...(ev.roomId && { roomId: ev.roomId })
+            }
+          },
+        },
+      });
+      // 구글 이벤트 ID를 personalTime에 저장 (역동기화 추적용) - User.updateOne 사용
+      if (insertResult.data?.id) {
+        try {
+          // suggestionId가 있으면 우선 매칭
+          let updated = false;
+          if (ev.suggestionId) {
+            const r = await User.updateOne(
+              { _id: userId, 'personalTimes.suggestionId': ev.suggestionId, 'personalTimes.googleEventId': { $in: [null, undefined] } },
+              { $set: { 'personalTimes.$.googleEventId': insertResult.data.id } }
+            );
+            if (r.modifiedCount > 0) updated = true;
+          }
+          // 없으면 제목+날짜+시간으로 매칭
+          if (!updated) {
+            const evDate = ev.startDateTime.substring(0, 10);
+            const evTime = ev.startDateTime.substring(11, 16);
+            const r = await User.updateOne(
+              { _id: userId, 'personalTimes.title': ev.title, 'personalTimes.specificDate': evDate, 'personalTimes.startTime': evTime, 'personalTimes.googleEventId': { $in: [null, undefined] } },
+              { $set: { 'personalTimes.$.googleEventId': insertResult.data.id } }
+            );
+            if (r.modifiedCount > 0) updated = true;
+          }
+          if (updated) {
+            console.log(`[syncEventsToGoogle] ✅ googleEventId 저장: ${insertResult.data.id} → ${ev.title}`);
+          }
+        } catch (saveErr) {
+          console.warn(`[syncEventsToGoogle] googleEventId 저장 실패:`, saveErr.message);
+        }
+      }
+      console.log(`[syncEventsToGoogle] 동기화 성공: ${ev.title} (googleEventId: ${insertResult.data?.id})`);
+      syncedCount++;
+    } catch (insertErr) {
+      console.error(`[syncEventsToGoogle] 이벤트 동기화 실패 (${ev.title}):`, insertErr.message);
+    }
+  }
+
+  return {
+    success: true,
+    synced: syncedCount,
+    skipped: skippedCount,
+    total: allEventsToSync.length,
+    msg: `${syncedCount}개 일정이 구글 캘린더에 동기화되었습니다.${skippedCount > 0 ? ` (${skippedCount}개 중복 스킵)` : ''}`
+  };
+};
+
+// API 라우트 핸들러 (기존 클라이언트 호출용)
+exports.syncEventsToGoogle = async (req, res) => {
+  try {
+    const result = await syncEventsToGoogleInternal(req.user.id);
+    if (!result.success) {
+      return res.status(401).json(result);
+    }
+    res.json(result);
+  } catch (error) {
+    console.error('syncEventsToGoogle error:', error.message);
+    res.status(500).json({ msg: '구글 캘린더 동기화에 실패했습니다.', error: error.message });
+  }
+};
+
+// 내부 호출용 export
+exports.syncEventsToGoogleInternal = syncEventsToGoogleInternal;
+
+// @desc    구글 캘린더에서 삭제된 일정을 앱 DB에서도 제거 (역동기화)
+// @route   POST /api/calendar/sync-from-google
+// @access  Private
+exports.syncFromGoogle = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user || !user.google || !user.google.refreshToken) {
+      return res.json({ success: true, removed: 0, msg: '구글 캘린더 미연동' });
+    }
+
+    // googleEventId가 있는 personalTimes 추출
+    const trackedEntries = (user.personalTimes || []).filter(pt => pt.googleEventId);
+    console.log(`[syncFromGoogle] 추적 대상: ${trackedEntries.length}개`);
+    if (trackedEntries.length === 0) {
+      return res.json({ success: true, removed: 0, msg: '추적할 일정 없음' });
+    }
+
+    // 구글 API 호출 (토큰은 수동 갱신, on('tokens') 사용 안 함)
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+    oauth2Client.setCredentials({
+      refresh_token: user.google.refreshToken,
+    });
+
+    // 토큰 수동 갱신
+    try {
+      const { credentials } = await oauth2Client.refreshAccessToken();
+      oauth2Client.setCredentials(credentials);
+    } catch (tokenErr) {
+      console.warn('[syncFromGoogle] 토큰 갱신 실패, 기존 토큰 사용');
+      oauth2Client.setCredentials({
+        access_token: user.google.accessToken,
+        refresh_token: user.google.refreshToken,
+      });
+    }
+
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    // 구글 이벤트 ID 수집
+    const threeMonthsAgo = new Date();
+    threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+    const oneYearLater = new Date();
+    oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
+
+    const googleEventIds = new Set();
+    const response = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: threeMonthsAgo.toISOString(),
+      timeMax: oneYearLater.toISOString(),
+      maxResults: 2500,
+      singleEvents: true,
+    });
+    (response.data.items || []).forEach(ev => googleEventIds.add(ev.id));
+    console.log(`[syncFromGoogle] 구글 이벤트: ${googleEventIds.size}개`);
+
+    // 삭제 대상 찾기
+    const toRemoveGoogleIds = [];
+    const removedSuggestionIds = [];
+    const seenSuggestionIds = new Set();
+    for (const pt of trackedEntries) {
+      if (!googleEventIds.has(pt.googleEventId)) {
+        console.log(`[syncFromGoogle] 삭제 대상: ${pt.title} (${pt.googleEventId})`);
+        toRemoveGoogleIds.push(pt.googleEventId);
+        if (pt.suggestionId && !seenSuggestionIds.has(pt.suggestionId)) {
+          seenSuggestionIds.add(pt.suggestionId);
+          removedSuggestionIds.push({ suggestionId: pt.suggestionId, userId: user._id });
+        }
+      }
+    }
+
+    if (toRemoveGoogleIds.length === 0) {
+      return res.json({ success: true, removed: 0 });
+    }
+
+    // DB에서 직접 $pull로 제거 (user.save() 충돌 방지)
+    const removeSet = new Set(toRemoveGoogleIds);
+    await User.updateOne(
+      { _id: req.user.id },
+      { $pull: { personalTimes: { googleEventId: { $in: toRemoveGoogleIds } } } }
+    );
+    console.log(`[syncFromGoogle] ✅ ${toRemoveGoogleIds.length}개 제거 완료`);
+
+    // 조율방 확정 일정 처리 (삭제/불참 + 채팅 메시지)
+    for (const { suggestionId, userId } of removedSuggestionIds) {
+      try {
+        const suggestion = await ScheduleSuggestion.findById(suggestionId);
+        if (!suggestion) continue;
+
+        const mr = suggestion.memberResponses.find(
+          r => (r.user._id?.toString() || r.user.toString()) === userId.toString()
+        );
+        if (!mr || mr.status !== 'accepted') continue;
+
+        // 불참 처리
+        mr.status = 'rejected';
+        mr.respondedAt = new Date();
+        mr.personalTimeId = null;
+
+        // 소유권 이전: 제안자가 구글에서 삭제한 경우
+        const isCreator = suggestion.suggestedBy && suggestion.suggestedBy.toString() === userId.toString();
+        if (isCreator) {
+          suggestion.suggestedBy = null;
+          console.log(`[syncFromGoogle] 소유권 이전: suggestedBy → null`);
+        }
+
+        // 남은 accepted 멤버 확인
+        const acceptedCount = suggestion.memberResponses.filter(r => r.status === 'accepted').length;
+        const allRejected = suggestion.memberResponses.every(r => r.status === 'rejected');
+        const shouldDelete = allRejected || acceptedCount === 0;
+
+        if (shouldDelete) {
+          // 남은 accepted 멤버들의 personalTime + 구글 캘린더도 정리
+          for (const otherMr of suggestion.memberResponses) {
+            if (otherMr.status === 'accepted') {
+              const memberId = otherMr.user._id?.toString() || otherMr.user.toString();
+              if (memberId !== userId.toString()) {
+                try {
+                  const memberUser = await User.findById(memberId);
+                  if (memberUser) {
+                    const memberPt = memberUser.personalTimes.find(pt => pt.suggestionId === suggestionId);
+                    const memberGoogleEventId = memberPt?.googleEventId || null;
+                    memberUser.personalTimes = memberUser.personalTimes.filter(pt => pt.suggestionId !== suggestionId);
+                    await memberUser.save();
+                    if (memberUser.google?.refreshToken) {
+                      try {
+                        await deleteFromGoogleCalendar(memberUser, {
+                          title: `[약속] ${suggestion.summary}`,
+                          specificDate: suggestion.date,
+                          startTime: suggestion.startTime,
+                          suggestionId, googleEventId: memberGoogleEventId
+                        });
+                      } catch (gcErr) {
+                        console.warn('[syncFromGoogle] 멤버 구글 삭제 실패:', gcErr.message);
+                      }
+                    }
+                  }
+                } catch (err) {
+                  console.warn('[syncFromGoogle] 멤버 정리 실패:', err.message);
+                }
+              }
+              otherMr.status = 'rejected';
+              otherMr.respondedAt = new Date();
+              otherMr.personalTimeId = null;
+            }
+          }
+          suggestion.status = 'cancelled';
+        } else {
+          // 남은 accepted 멤버들의 participants 수 업데이트
+          for (const otherMr of suggestion.memberResponses) {
+            if (otherMr.status === 'accepted') {
+              const memberId = otherMr.user._id?.toString() || otherMr.user.toString();
+              try {
+                const memberUser = await User.findById(memberId);
+                if (memberUser) {
+                  const memberPt = memberUser.personalTimes.find(pt => pt.suggestionId === suggestionId);
+                  if (memberPt) {
+                    memberPt.participants = acceptedCount;
+                    await memberUser.save();
+                  }
+                }
+              } catch (err) {
+                console.warn('[syncFromGoogle] participants 업데이트 실패:', err.message);
+              }
+            }
+          }
+        }
+
+        await suggestion.save();
+
+        // RejectedSuggestion 기록
+        try {
+          const rejected = new RejectedSuggestion({
+            room: suggestion.room,
+            suggestion: {
+              summary: suggestion.summary,
+              date: suggestion.date,
+              startTime: suggestion.startTime,
+              endTime: suggestion.endTime,
+              location: suggestion.location
+            },
+            rejectedBy: userId,
+            rejectedAt: new Date()
+          });
+          await rejected.save();
+        } catch (rejErr) {
+          console.warn('[syncFromGoogle] RejectedSuggestion 저장 실패:', rejErr.message);
+        }
+
+        // 채팅 시스템 메시지 전송
+        const triggerUser = await User.findById(userId);
+        const userName = triggerUser?.firstName || '사용자';
+        const messageContent = shouldDelete
+          ? `${userName}님이 구글 캘린더에서 일정을 삭제했습니다: ${suggestion.date} ${suggestion.startTime} ${suggestion.summary}`
+          : `${userName}님이 구글 캘린더에서 일정에 불참했습니다: ${suggestion.date} ${suggestion.startTime} ${suggestion.summary}`;
+
+        const systemMsg = new Message({
+          room: suggestion.room,
+          sender: userId,
+          content: messageContent,
+          type: 'system'
+        });
+        await systemMsg.save();
+        await systemMsg.populate('sender', 'firstName lastName');
+
+        // Socket 이벤트
+        if (global.io && suggestion.room) {
+          const roomKey = `room-${suggestion.room}`;
+          global.io.to(roomKey).emit('chat-message', systemMsg);
+
+          if (shouldDelete) {
+            global.io.to(roomKey).emit('suggestion-deleted', { suggestionId });
+          } else {
+            const updated = await ScheduleSuggestion.findById(suggestionId)
+              .populate('memberResponses.user', 'firstName lastName email')
+              .populate('suggestedBy', 'firstName lastName email');
+            global.io.to(roomKey).emit('suggestion-updated', {
+              suggestionId,
+              userId,
+              status: 'rejected',
+              memberResponses: updated.memberResponses,
+              suggestedBy: updated.suggestedBy
+            });
+          }
+        }
+
+        console.log(`[syncFromGoogle] 조율방 처리 완료: ${shouldDelete ? '삭제' : '불참'} - ${suggestion.summary}`);
+      } catch (suggErr) {
+        console.warn('[syncFromGoogle] 조율방 처리 실패:', suggErr.message);
+      }
+    }
+
+    res.json({ success: true, removed: toRemoveGoogleIds.length });
+  } catch (error) {
+    console.error('[syncFromGoogle] error:', error.message, error.stack);
+    res.status(500).json({ success: false, msg: '역동기화 실패', error: error.message });
+  }
+};
+
+// 이미지에서 스케줄 정보 추출
+exports.analyzeImage = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: '이미지 파일이 업로드되지 않았습니다.'
+      });
+    }
+
+    // Gemini Vision 모델 가져오기
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+    // 이미지를 Base64로 변환
+    const imageBase64 = req.file.buffer.toString('base64');
+
+    // 현재 날짜 정보 생성
+    const today = new Date();
+    const currentDate = today.toISOString().split('T')[0];
+    const currentDay = today.getDay(); // 0=일요일, 1=월요일, ...
+
+    // 이번 주 월요일부터 금요일까지의 날짜 계산
+    const getThisWeekDates = (today) => {
+      const dates = {};
+      const daysOfWeek = ['월', '화', '수', '목', '금'];
+
+      // 한국 시간대로 현재 날짜 계산
+      const koreaDate = new Date(today.toLocaleString("en-US", {timeZone: "Asia/Seoul"}));
+
+      // 이번 주 월요일 찾기
+      const thisMonday = new Date(koreaDate);
+      const dayOfWeek = koreaDate.getDay(); // 0=일요일, 1=월요일, ...
+      const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1; // 일요일인 경우 지난 주 월요일로
+      thisMonday.setDate(koreaDate.getDate() - daysFromMonday);
+
+      daysOfWeek.forEach((day, index) => {
+        const date = new Date(thisMonday);
+        date.setDate(thisMonday.getDate() + index);
+        // 한국 시간대 기준으로 YYYY-MM-DD 형식 생성
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const dayStr = String(date.getDate()).padStart(2, '0');
+        dates[day] = `${year}-${month}-${dayStr}`;
+      });
+
+      return dates;
+    };
+
+    const weekDates = getThisWeekDates(today);
+
+    // 프롬프트 구성
+    const prompt = `
+이 이미지에서 학교 시간표나 일정 정보를 추출해주세요. 정확한 JSON 형태로만 반환해주세요.
+
+중요: 응답은 반드시 유효한 JSON 형식이어야 하며, 주석이나 추가 설명 없이 오직 JSON만 반환해주세요.
+
+현재 정보:
+- 오늘 날짜: ${currentDate}
+- 이번 주 날짜: 월(${weekDates.월}), 화(${weekDates.화}), 수(${weekDates.수}), 목(${weekDates.목}), 금(${weekDates.금})
+
+학교 시간표 인식 규칙:
+- 1교시: 09:00-09:50 (50분 수업)
+- 2교시: 10:00-10:50
+- 3교시: 11:00-11:50
+- 4교시: 12:00-12:50
+- 5교시: 13:40-14:30 (점심시간 후)
+- 6교시: 14:40-15:30
+- 7교시: 15:40-16:30
+- 8교시: 16:40-17:30
+
+요일별 날짜 매핑:
+- 월요일 → ${weekDates.월}
+- 화요일 → ${weekDates.화}
+- 수요일 → ${weekDates.수}
+- 목요일 → ${weekDates.목}
+- 금요일 → ${weekDates.금}
+
+반환 형식:
+{
+  "schedules": [
+    {
+      "title": "과목명 (예: 수학, 영어, 과학 등)",
+      "date": "YYYY-MM-DD",
+      "time": "HH:MM-HH:MM",
+      "location": "교실",
+      "description": "N교시"
+    }
+  ]
+}
+
+처리 예시:
+- 이미지에 "월요일 1교시 수학"이 있으면 → title: "수학", date: "${weekDates.월}", time: "09:00-09:50", description: "1교시"
+- "화 3교시 영어"가 있으면 → title: "영어", date: "${weekDates.화}", time: "11:00-11:50", description: "3교시"
+
+일반 일정의 경우:
+- 시간 범위가 있는 경우: "HH:MM-HH:MM" 형식 사용
+- 시간이 없는 경우: "00:00-00:00" 사용
+
+이미지에서 일정을 찾을 수 없는 경우:
+{
+  "schedules": []
+}
+`;
+
+    // 이미지와 함께 API 호출
+    const result = await model.generateContent([
+      prompt,
+      {
+        inlineData: {
+          data: imageBase64,
+          mimeType: req.file.mimetype
+        }
+      }
+    ]);
+
+    const response = await result.response;
+    const text = response.text();
+
+    try {
+
+      // ```json으로 감싸진 JSON 블록 찾기
+      let jsonString = '';
+      const jsonBlockMatch = text.match(/```json\s*([\s\S]*?)\s*```/);
+      if (jsonBlockMatch) {
+        jsonString = jsonBlockMatch[1];
+      } else {
+        // 일반 JSON 객체 찾기
+        const jsonMatch = text.match(/\{[\s\S]*?\}/);
+        if (jsonMatch) {
+          jsonString = jsonMatch[0];
+        }
+      }
+
+      if (jsonString) {
+        // 주석 제거 (// 주석)
+        jsonString = jsonString.replace(/\/\/.*$/gm, '');
+        // 여러 줄 주석 제거 (/* */ 주석)
+        jsonString = jsonString.replace(/\/\*[\s\S]*?\*\//g, '');
+        // 마지막 쉼표 제거
+        jsonString = jsonString.replace(/,(\s*[}\]])/g, '$1');
+
+        const scheduleData = JSON.parse(jsonString);
+
+        if (scheduleData.schedules && scheduleData.schedules.length > 0) {
+          // 추출된 스케줄이 있는 경우
+          return res.json({
+            success: true,
+            message: `총 ${scheduleData.schedules.length}개의 일정을 찾았습니다. 이 일정들을 추가하시겠습니까?`,
+            extractedSchedules: scheduleData.schedules
+          });
+        } else {
+          // 스케줄을 찾지 못한 경우
+          return res.json({
+            success: false,
+            message: '이미지에서 일정 정보를 찾을 수 없습니다. 다른 이미지를 시도해보시거나 텍스트로 일정을 입력해주세요.'
+          });
+        }
+      } else {
+        throw new Error('JSON 형식을 찾을 수 없음');
+      }
+    } catch (parseError) {
+
+      // JSON 파싱 실패 시 텍스트 응답 처리
+      return res.json({
+        success: false,
+        message: '이미지 분석 중 오류가 발생했습니다. AI 응답을 처리할 수 없습니다. 다시 시도해보세요.'
+      });
+    }
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: '이미지 분석 중 오류가 발생했습니다: ' + error.message
+    });
+  }
+};

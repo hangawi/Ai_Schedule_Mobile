@@ -1,0 +1,87 @@
+.simplified-schedule {
+   display: flex;
+   flex-direction: column;
+   gap: 8px;
+   max-height: 300px;
+   overflow-y: auto;
+   overflow-x: hidden;
+   padding-right: 4px;
+}
+
+.simplified-schedule::-webkit-scrollbar {
+   width: 6px;
+}
+
+.simplified-schedule::-webkit-scrollbar-track {
+   background: #f1f1f1;
+   border-radius: 3px;
+}
+
+.simplified-schedule::-webkit-scrollbar-thumb {
+   background: #cbd5e1;
+   border-radius: 3px;
+}
+
+.simplified-schedule::-webkit-scrollbar-thumb:hover {
+   background: #94a3b8;
+}
+
+.schedule-group {
+   background: #ffffff;
+   border-radius: 6px;
+   padding: 8px 10px;
+}
+
+.schedule-date {
+   font-size: 12px;
+   font-weight: 700;
+   color: #1f2937;
+   margin-bottom: 6px;
+}
+
+.schedule-blocks {
+   display: flex;
+   flex-direction: row;
+   flex-wrap: wrap;
+   gap: 6px;
+}
+
+.time-block {
+   border-radius: 6px;
+   padding: 8px 10px;
+   display: flex;
+   flex-direction: row;
+   gap: 6px;
+   align-items: center;
+}
+
+.preference-block {
+   background: #3b82f6;
+   border: 1px solid #2563eb;
+}
+
+.personal-block {
+   background: #ef4444;
+   border: 1px solid #dc2626;
+}
+
+.time-block-time {
+   font-size: 13px;
+   font-weight: 700;
+   color: #ffffff;
+   line-height: 1.2;
+}
+
+.time-block-name {
+   font-size: 11px;
+   color: #ffffff;
+   opacity: 0.95;
+   line-height: 1.2;
+}
+
+.simplified-schedule-empty {
+   text-align: center;
+   padding: 20px;
+   color: #9ca3af;
+   font-size: 11px;
+}

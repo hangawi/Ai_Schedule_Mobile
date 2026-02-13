@@ -1,0 +1,635 @@
+/**
+ * ===================================================================================================
+ * CalendarView.js - 월간 캘린더 뷰 컴포넌트
+ * ===================================================================================================
+ *
+ * 📍 위치: 프론트엔드 > client/src/components/calendar/CalendarView.js
+ *
+ * 🎯 주요 기능:
+ *    - 월간 캘린더 그리드 표시
+ *    - 일정, 예외, 개인 시간을 날짜별로 시각화
+ *    - 휴무일 표시
+ *    - 월 이동 및 오늘 날짜로 이동
+ *    - 날짜 클릭 시 상세 정보 표시
+ *    - 일정 개수 카운팅 및 병합
+ *
+ * 🔗 연결된 파일:
+ *    - lucide-react - 아이콘 라이브러리 (ChevronLeft, ChevronRight)
+ *
+ * 💡 UI 위치:
+ *    - 화면: 프로필 탭 > 일정 관리
+ *    - 접근: 프로필 탭에서 자동 표시
+ *    - 섹션: 월 선택, 캘린더 그리드
+ *
+ * ✏️ 수정 가이드:
+ *    - 이 파일을 수정하면: 월간 캘린더 표시 방식 변경
+ *    - 일정 표시 색상 변경: renderMonthView의 colorMap 수정
+ *    - 캘린더 그리드 크기 변경: totalDays 값 수정 (현재 42 = 6주)
+ *    - 일정 병합 로직 변경: getScheduleCount, getExceptionCount 함수 수정
+ *
+ * 📝 참고사항:
+ *    - 일요일 시작 기준 (0=일요일, 6=토요일)
+ *    - 일정은 파란색, 예외는 우선순위별 파란색 톤, 개인 시간은 빨간색으로 표시
+ *    - 휴무일은 회색 배경에 "휴무일" 뱃지 표시
+ *    - 최대 9개까지 막대로 표시, 초과 시 "+더보기" 표시
+ *
+ * ===================================================================================================
+ */
+
+import React, { useState, useEffect } from 'react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
+
+/**
+ * CalendarView - 월간 캘린더 뷰 메인 컴포넌트
+ *
+ * @param {Object} props - 컴포넌트 props
+ * @param {Array} props.schedule - 일정 배열
+ * @param {Function} props.setSchedule - 일정 업데이트 함수
+ * @param {boolean} props.readOnly - 읽기 전용 모드
+ * @param {Array} props.exceptions - 예외 배열
+ * @param {Array} props.personalTimes - 개인 시간 배열
+ * @param {Function} props.onRemoveException - 예외 삭제 핸들러
+ * @param {Function} props.onDateClick - 날짜 클릭 핸들러
+ * @param {Date} props.selectedDate - 선택된 날짜
+ * @param {Function} props.onShowAlert - 알림 표시 함수
+ * @param {Function} props.onAutoSave - 자동 저장 함수
+ * @param {Function} props.onMonthChange - 월 변경 핸들러
+ *
+ * @returns {JSX.Element} 월간 캘린더 UI
+ */
+const CalendarView = ({
+  schedule,
+  setSchedule,
+  readOnly,
+  exceptions = [],
+  personalTimes = [],
+  onRemoveException,
+  onDateClick,
+  selectedDate,
+  onShowAlert,
+  onAutoSave,
+  onMonthChange
+}) => {
+  const [currentDate, setCurrentDate] = useState(new Date());
+  const [calendarDates, setCalendarDates] = useState([]);
+
+  const monthNames = [
+    '1월', '2월', '3월', '4월', '5월', '6월',
+    '7월', '8월', '9월', '10월', '11월', '12월'
+  ];
+
+  const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
+
+  useEffect(() => {
+    generateCalendarDates();
+    if (onMonthChange) {
+      onMonthChange(currentDate);
+    }
+  }, [currentDate, schedule, exceptions, personalTimes]);
+
+  useEffect(() => {
+    const handleCalendarUpdate = (event) => {
+      generateCalendarDates();
+    };
+
+    window.addEventListener('calendarUpdate', handleCalendarUpdate);
+    return () => {
+      window.removeEventListener('calendarUpdate', handleCalendarUpdate);
+    };
+  }, [schedule, exceptions, personalTimes]);
+
+  /**
+   * generateCalendarDates
+   *
+   * @description 월간 캘린더 날짜 데이터를 생성하여 상태를 업데이트합니다.
+   *
+   * @example
+   * generateCalendarDates();
+   *
+   * @note
+   * - `generateMonthDates` 함수를 호출하여 실제 날짜 데이터를 생성합니다.
+   * - `useEffect` 내에서 `currentDate`, `schedule`, `exceptions`, `personalTimes`가 변경될 때 호출됩니다.
+   */
+  const generateCalendarDates = () => {
+    generateMonthDates();
+  };
+
+  /**
+   * generateMonthDates
+   *
+   * @description 현재 `currentDate`를 기준으로 6주(42일)에 해당하는 월간 캘린더 날짜 배열을 생성합니다.
+   *              각 날짜 객체에는 일정, 예외, 개인 시간 등의 정보가 포함됩니다.
+   *
+   * @example
+   * generateMonthDates();
+   * // `calendarDates` 상태가 42개의 날짜 정보 객체 배열로 업데이트됩니다.
+   *
+   * @note
+   * - 캘린더는 항상 6주(42일)로 표시되며, 일요일부터 시작합니다.
+   * - 각 날짜 객체는 `date`, `day`, `isCurrentMonth`, `isToday`, `isSelected`, `hasSchedule`, `hasException`, `hasPersonalTime`, `hasHoliday`, `scheduleCount`, `exceptionCount`, `personalTimeCount`, `totalCount`, `exceptions` 속성을 가집니다.
+   * - 이 함수는 `generateCalendarDates` 내부에서 호출됩니다.
+   */
+  const generateMonthDates = () => {
+    const year = currentDate.getFullYear();
+    const month = currentDate.getMonth();
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const startDate = new Date(firstDay);
+
+    // 일요일부터 시작하도록 조정
+    const firstDayOfWeek = firstDay.getDay();
+    startDate.setDate(firstDay.getDate() - firstDayOfWeek);
+
+    const dates = [];
+    const totalDays = 42; // 6주 * 7일
+
+    for (let i = 0; i < totalDays; i++) {
+      const date = new Date(startDate);
+      date.setDate(startDate.getDate() + i);
+      const isCurrentMonth = date.getMonth() === month;
+      const isToday = date.toDateString() === new Date().toDateString();
+      const isSelected = selectedDate && date.toDateString() === selectedDate.toDateString();
+
+      const hasPersonalTime = hasPersonalTimeForDate(date);
+
+      const scheduleCount = getScheduleCount(date);
+      const exceptionCount = getExceptionCount(date);
+      const personalTimeCount = getPersonalTimeCount(date);
+
+      // exception 정보도 가져오기
+      const dateYear = date.getFullYear();
+      const dateMonth = String(date.getMonth() + 1).padStart(2, '0');
+      const dateDay = String(date.getDate()).padStart(2, '0');
+      const dateStr = `${dateYear}-${dateMonth}-${dateDay}`;
+      const dateExceptions = exceptions.filter(ex => ex.specificDate === dateStr && ex.title !== '휴무일' && !ex.isHoliday);
+
+      dates.push({
+        date: new Date(date),
+        day: date.getDate(),
+        isCurrentMonth,
+        isToday,
+        isSelected,
+        hasSchedule: scheduleCount > 0,
+        hasException: exceptionCount > 0,
+        hasPersonalTime: personalTimeCount > 0,
+        hasHoliday: hasHolidayForDate(date),
+        scheduleCount,
+        exceptionCount,
+        personalTimeCount,
+        totalCount: scheduleCount + exceptionCount + personalTimeCount,
+        exceptions: dateExceptions
+      });
+    }
+
+    setCalendarDates(dates);
+  };
+
+
+  /**
+   * hasScheduleForDate - 특정 날짜의 일정 존재 여부 확인
+   *
+   * @description 주어진 날짜에 `schedule` 배열을 기반으로 한 일정이 있는지 확인합니다.
+   *              특정 날짜(specificDate) 또는 요일(dayOfWeek)을 기준으로 검사합니다.
+   * @param {Date} date - 확인할 날짜 객체
+   * @returns {boolean} 해당 날짜에 일정이 있으면 true, 없으면 false
+   *
+   * @example
+   * const date = new Date('2025-12-25');
+   * const hasSchedule = hasScheduleForDate(date);
+   *
+   * @note
+   * - `schedule` 상태 배열을 참조합니다.
+   * - `specificDate`가 있는 일정은 해당 날짜와 직접 비교하고, 없으면 요일을 비교합니다.
+   */
+  const hasScheduleForDate = (date) => {
+    const dayOfWeek = date.getDay();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+    
+    // defaultSchedule는 모두 가능한 시간이므로 isBlocked 체크 불필요
+    return schedule.some(s => {
+      // specificDate가 있으면 날짜로 비교, 없으면 dayOfWeek로 비교
+      if (s.specificDate) {
+        return s.specificDate === dateStr;
+      } else {
+        return s.dayOfWeek === dayOfWeek;
+      }
+    });
+  };;
+  /**
+   * getScheduleCount - 특정 날짜의 병합된 일정 개수 반환
+   *
+   * @description 주어진 날짜에 해당하는 일정을 찾아, 연속된 시간을 병합한 후의 총 일정 개수를 반환합니다.
+   * @param {Date} date - 개수를 계산할 날짜 객체
+   * @returns {number} 병합된 일정의 총 개수
+   *
+   * @example
+   * const date = new Date('2025-12-25');
+   * const count = getScheduleCount(date);
+   *
+   * @note
+   * - `schedule` 상태 배열을 참조하며, `specificDate`와 `dayOfWeek`를 모두 고려합니다.
+   * - 시간이 연속되고 우선순위가 같은 일정은 하나의 일정으로 병합하여 계산합니다.
+   */
+  const getScheduleCount = (date) => {
+    const dayOfWeek = date.getDay();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+    
+    const slots = schedule.filter(s => {
+      if (s.specificDate) {
+        return s.specificDate === dateStr;
+      } else {
+        return s.dayOfWeek === dayOfWeek;
+      }
+    });
+    
+    // 병합
+    if (slots.length === 0) return 0;
+    const sorted = [...slots].sort((a, b) => a.startTime.localeCompare(b.startTime));
+    const merged = [];
+    let current = { ...sorted[0] };
+    
+    for (let i = 1; i < sorted.length; i++) {
+      const slot = sorted[i];
+      if (current.endTime === slot.startTime && current.priority === slot.priority) {
+        current.endTime = slot.endTime;
+      } else {
+        merged.push(current);
+        current = { ...slot };
+      }
+    }
+    merged.push(current);
+    return merged.length;
+  };;
+
+  /**
+   * getExceptionCount - 특정 날짜의 병합된 예외 일정 개수 반환
+   *
+   * @description 주어진 날짜에 해당하는 예외 일정을 찾아, 연속된 시간을 병합한 후의 총 예외 개수를 반환합니다.
+   *              '휴무일'은 계산에서 제외됩니다.
+   * @param {Date} date - 개수를 계산할 날짜 객체
+   * @returns {number} 병합된 예외 일정의 총 개수
+   *
+   * @example
+   * const date = new Date('2025-12-25');
+   * const count = getExceptionCount(date);
+   *
+   * @note
+   * - `exceptions` 상태 배열을 참조합니다.
+   * - 시간이 연속되는 예외는 하나의 예외로 병합하여 계산합니다.
+   * - `title`이 '휴무일'이거나 `isHoliday`가 true인 예외는 카운트에서 제외됩니다.
+   */
+  const getExceptionCount = (date) => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+
+    const exs = exceptions.filter(ex => {
+      const exDateStr = ex.specificDate;
+      return exDateStr === dateStr && ex.title !== '휴무일' && !ex.isHoliday;
+    });
+    
+    // 병합
+    if (exs.length === 0) return 0;
+    const sorted = [...exs].sort((a, b) => {
+      const aTime = a.startTime.includes('T') ? new Date(a.startTime).getHours() * 60 + new Date(a.startTime).getMinutes() : 
+                    parseInt(a.startTime.split(':')[0]) * 60 + parseInt(a.startTime.split(':')[1]);
+      const bTime = b.startTime.includes('T') ? new Date(b.startTime).getHours() * 60 + new Date(b.startTime).getMinutes() : 
+                    parseInt(b.startTime.split(':')[0]) * 60 + parseInt(b.startTime.split(':')[1]);
+      return aTime - bTime;
+    });
+    
+    const merged = [];
+    let current = { ...sorted[0] };
+    
+    for (let i = 1; i < sorted.length; i++) {
+      const slot = sorted[i];
+      const currentEnd = current.endTime.includes('T') ? 
+        `${String(new Date(current.endTime).getHours()).padStart(2, '0')}:${String(new Date(current.endTime).getMinutes()).padStart(2, '0')}` : 
+        current.endTime;
+      const slotStart = slot.startTime.includes('T') ? 
+        `${String(new Date(slot.startTime).getHours()).padStart(2, '0')}:${String(new Date(slot.startTime).getMinutes()).padStart(2, '0')}` : 
+        slot.startTime;
+      
+      if (currentEnd === slotStart) {
+        current.endTime = slot.endTime;
+      } else {
+        merged.push(current);
+        current = { ...slot };
+      }
+    }
+    merged.push(current);
+    return merged.length;
+  };;
+
+  /**
+   * getPersonalTimeCount - 특정 날짜의 개인 시간 개수 반환
+   *
+   * @description 주어진 날짜에 해당하는 개인 시간(반복 또는 특정 날짜)의 개수를 반환합니다.
+   * @param {Date} date - 개수를 계산할 날짜 객체
+   * @returns {number} 개인 시간의 총 개수
+   *
+   * @example
+   * const date = new Date('2025-12-25');
+   * const count = getPersonalTimeCount(date);
+   *
+   * @note
+   * - `personalTimes` 상태 배열을 참조합니다.
+   * - 반복되는 개인 시간(`isRecurring`, `days`)과 특정 날짜의 개인 시간(`isRecurring: false`, `specificDate`)을 모두 고려합니다.
+   * - 개인 시간은 병합되지 않고 각 항목을 개별로 카운트합니다.
+   */
+  const getPersonalTimeCount = (date) => {
+    const dayOfWeek = date.getDay() === 0 ? 7 : date.getDay();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+
+    const pts = personalTimes.filter(pt => {
+      if (pt.isRecurring !== false && pt.days && pt.days.includes(dayOfWeek)) {
+        return true;
+      }
+      if (pt.isRecurring === false && pt.specificDate) {
+        return pt.specificDate === dateStr;
+      }
+      return false;
+    });
+    
+    // personalTimes는 이미 개별 항목이므로 그대로 개수 반환
+    return pts.length;
+  };;
+
+  /**
+   * hasExceptionForDate - 특정 날짜의 예외 일정 존재 여부 확인
+   *
+   * @description 주어진 날짜에 '휴무일'이 아닌 예외 일정이 있는지 확인합니다.
+   * @param {Date} date - 확인할 날짜 객체
+   * @returns {boolean} 해당 날짜에 예외가 있으면 true, 없으면 false
+   *
+   * @example
+   * const date = new Date('2025-12-26');
+   * const hasException = hasExceptionForDate(date);
+   *
+   * @note
+   * - `exceptions` 상태 배열을 참조합니다.
+   * - `title`이 '휴무일'이거나 `isHoliday`가 true인 항목은 예외로 간주하지 않습니다.
+   */
+  const hasExceptionForDate = (date) => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+
+    const hasException = exceptions.some(ex => {
+      // specificDate 필드를 사용해야 함 (startTime은 "10:00" 형식이므로 날짜가 아님)
+      const exDateStr = ex.specificDate;
+      const isMatch = exDateStr === dateStr && ex.title !== '휴무일' && !ex.isHoliday;
+
+      return isMatch;
+    });
+
+    return hasException;
+  };
+
+  /**
+   * hasHolidayForDate - 특정 날짜의 휴무일 존재 여부 확인
+   *
+   * @description 주어진 날짜가 '휴무일'로 지정된 예외인지 확인합니다.
+   * @param {Date} date - 확인할 날짜 객체
+   * @returns {boolean} 해당 날짜가 휴무일이면 true, 아니면 false
+   *
+   * @example
+   * const date = new Date('2025-01-01');
+   * const isHoliday = hasHolidayForDate(date);
+   *
+   * @note
+   * - `exceptions` 상태 배열을 참조합니다.
+   * - `title`이 '휴무일'이거나 `isHoliday`가 true인 항목을 휴무일로 간주합니다.
+   */
+  const hasHolidayForDate = (date) => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+
+    return exceptions.some(ex => {
+      // specificDate 필드를 사용해야 함
+      const exDateStr = ex.specificDate;
+      return exDateStr === dateStr && (ex.title === '휴무일' || ex.isHoliday);
+    });
+  };
+
+  const hasPersonalTimeForDate = (date) => {
+    // JavaScript getDay(): 0=일요일, 1=월요일, ..., 6=토요일
+    // personalTimes.days: 1=월요일, 2=화요일, ..., 7=일요일
+    const dayOfWeek = date.getDay() === 0 ? 7 : date.getDay();
+    // 로컬 날짜를 YYYY-MM-DD 형식으로 정확히 변환 (UTC 시간대 문제 방지)
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+
+    return personalTimes.some(pt => {
+      // 반복되는 개인시간 체크
+      if (pt.isRecurring !== false && pt.days && pt.days.includes(dayOfWeek)) {
+        return true;
+      }
+
+      // 특정 날짜의 개인시간 체크
+      if (pt.isRecurring === false && pt.specificDate) {
+        // YYYY-MM-DD 형식의 문자열을 직접 비교 (시간대 문제 방지)
+        const isMatch = pt.specificDate === dateStr;
+        return isMatch;
+      }
+
+      return false;
+    });
+  };
+
+  /**
+   * navigateMonth - 월 이동 처리
+   *
+   * @param {number} direction - 이동 방향 (-1: 이전 달, 1: 다음 달)
+   */
+  const navigateMonth = (direction) => {
+    const newDate = new Date(currentDate);
+    newDate.setMonth(currentDate.getMonth() + direction);
+    setCurrentDate(newDate);
+    if (onMonthChange) {
+      onMonthChange(newDate);
+    }
+  };
+
+  /**
+   * goToToday - 오늘 날짜로 이동
+   */
+  const goToToday = () => {
+    const today = new Date();
+    setCurrentDate(today);
+    if (onMonthChange) {
+      onMonthChange(today);
+    }
+  };
+
+  /**
+   * handleDateClick - 날짜 클릭 처리
+   *
+   * @param {Date} date - 클릭한 날짜
+   */
+  const handleDateClick = (date) => {
+    if (onDateClick) {
+      onDateClick(date);
+    }
+  };
+
+
+  /**
+   * renderCalendarHeader - 캘린더 헤더 렌더링
+   *
+   * @description 현재 연도와 월, 그리고 월 이동 및 '오늘'로 가기 버튼을 포함한 헤더를 렌더링합니다.
+   * @returns {JSX.Element} 캘린더 헤더 UI
+   *
+   * @note
+   * - `currentDate` 상태를 사용하여 현재 표시된 연도와 월을 결정합니다.
+   * - `navigateMonth`와 `goToToday` 함수를 버튼 클릭 이벤트에 연결합니다.
+   */
+  const renderCalendarHeader = () => (
+    <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center space-x-4">
+        <h2 className="text-xl font-semibold">
+          {`${currentDate.getFullYear()}년 ${monthNames[currentDate.getMonth()]}`}
+        </h2>
+
+        <div className="flex items-center space-x-2">
+          <button
+onClick={() => navigateMonth(-1)}
+            className="p-2 rounded-lg bg-gray-200 hover:bg-gray-300 transition-colors"
+          >
+            <ChevronLeft size={16} />
+          </button>
+
+          <button
+            onClick={goToToday}
+            className="px-3 py-2 rounded-lg bg-blue-500 text-white hover:bg-blue-600 transition-colors text-sm"
+          >
+            오늘
+          </button>
+
+          <button
+onClick={() => navigateMonth(1)}
+            className="p-2 rounded-lg bg-gray-200 hover:bg-gray-300 transition-colors"
+          >
+            <ChevronRight size={16} />
+          </button>
+        </div>
+      </div>
+
+    </div>
+  );
+
+  /**
+   * renderMonthView - 월간 캘린더 그리드 렌더링
+   *
+   * @description 6주(42일) 분량의 캘린더 그리드를 렌더링합니다. 각 날짜 셀에는 일정, 예외, 개인 시간 등의 정보가 시각적으로 표시됩니다.
+   * @returns {JSX.Element} 월간 캘린더 그리드 UI
+   *
+   * @note
+   * - `calendarDates` 상태 배열을 기반으로 각 날짜 셀을 렌더링합니다.
+   * - 휴무일, 오늘, 선택된 날짜, 현재 월에 속하지 않는 날짜 등을 각기 다른 스타일로 표시합니다.
+   * - 각 날짜의 일정, 예외, 개인 시간은 색상 막대로 요약하여 표시됩니다.
+   */
+  const renderMonthView = () => (
+    <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+      {/* 요일 헤더 */}
+      <div className="grid grid-cols-7 bg-gray-50 border-b border-gray-200">
+        {dayNames.map((dayName, index) => (
+          <div
+            key={index}
+            className={`p-3 text-center text-sm font-medium ${
+              index === 0 ? 'text-red-500' : index === 6 ? 'text-blue-500' : 'text-gray-700'
+            }`}
+          >
+            {dayName}
+          </div>
+        ))}
+      </div>
+
+      {/* 캘린더 그리드 */}
+      <div className="grid grid-cols-7">
+        {calendarDates.map((dateInfo, index) => (
+          <div
+            key={index}
+            className={`
+              h-20 border-r border-b border-gray-100 p-2 transition-colors
+              ${dateInfo.hasHoliday ? 'bg-gray-200 text-gray-500' : ''}
+              ${!dateInfo.hasHoliday && (dateInfo.isCurrentMonth ? 'bg-white hover:bg-blue-50' : 'bg-gray-50 text-gray-400')}
+              ${dateInfo.isToday && !dateInfo.hasHoliday ? 'bg-blue-100' : ''}
+              ${dateInfo.isSelected && !dateInfo.hasHoliday ? 'bg-blue-200 ring-2 ring-blue-500' : ''}
+              cursor-pointer
+            `}
+            onClick={() => handleDateClick(dateInfo.date)}
+          >
+            <div className="flex flex-col h-full">
+              <div className={`text-sm font-medium mb-1 ${
+                dateInfo.isToday && !dateInfo.hasHoliday ? 'text-blue-600' : ''
+              }`}>
+                {dateInfo.day}
+              </div>
+
+              {dateInfo.hasHoliday ? (
+                <div className="flex-1 flex items-center justify-center">
+                  <div className="bg-black text-white px-2 py-1 rounded-full text-xs font-bold shadow-md border border-gray-600 flex items-center justify-center min-h-[20px]">
+                    휴무일
+                  </div>
+                </div>
+              ) : (
+                <div className="flex-1 flex flex-col justify-center space-y-1">
+                  {dateInfo.scheduleCount > 0 && (
+                    [...Array(Math.min(dateInfo.scheduleCount, 3))].map((_, i) => (
+                      <div key={`schedule-${i}`} className="w-full h-1 bg-blue-500 rounded-full"></div>
+                    ))
+                  )}
+                  {dateInfo.exceptionCount > 0 && dateInfo.exceptions && (
+                    dateInfo.exceptions.slice(0, 3).map((ex, i) => {
+                      const priority = ex.priority !== undefined ? ex.priority : 3;
+                      const colorMap = {
+                        3: 'bg-blue-600',
+                        2: 'bg-blue-400',
+                        1: 'bg-blue-200'
+                      };
+                      const color = colorMap[priority] || 'bg-blue-600';
+                      return <div key={`exception-${i}`} className={`w-full h-1 ${color} rounded-full`}></div>;
+                    })
+                  )}
+                  {dateInfo.personalTimeCount > 0 && (
+                    [...Array(Math.min(dateInfo.personalTimeCount, 3))].map((_, i) => (
+                      <div key={`personal-${i}`} className="w-full h-1 bg-red-500 rounded-full"></div>
+                    ))
+                  )}
+                  {(dateInfo.scheduleCount + dateInfo.exceptionCount + dateInfo.personalTimeCount) > 9 && (
+                    <div className="text-xs text-center text-gray-500">+더보기</div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      {renderCalendarHeader()}
+      {renderMonthView()}
+    </div>
+  );
+};
+
+export default CalendarView;

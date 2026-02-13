@@ -1,0 +1,460 @@
+/**
+ * ===================================================================================================
+ * CoordinationCalendarView.js - 조율 캘린더 뷰 컴포넌트
+ * ===================================================================================================
+ *
+ * 📍 위치: 프론트엔드 > client/src/components/calendar/CoordinationCalendarView.js
+ *
+ * 🎯 주요 기능:
+ *    - 조율 모드 주간 캘린더 표시
+ *    - 멤버별 배정 시간 시각화
+ *    - 차단 시간, 이동 시간 표시
+ *    - 날짜별 요약 바 (배정/차단/빈 시간 비율)
+ *    - 주 이동 및 오늘 날짜로 이동
+ *
+ * 🔗 연결된 파일:
+ *    - ../../utils/timetableHelpers.js - 시간표 헬퍼 함수
+ *    - lucide-react - 아이콘 라이브러리
+ *
+ * 💡 UI 위치:
+ *    - 화면: 조율 탭 > 주간 캘린더
+ *    - 접근: 방 참가 후 조율 탭 선택
+ *    - 섹션: 주 선택, 날짜별 요약 바, 날짜 그리드
+ *
+ * ✏️ 수정 가이드:
+ *    - 이 파일을 수정하면: 조율 모드 캘린더 표시 방식 변경
+ *    - 요약 바 색상 변경: DaySummaryBar의 bgColor 설정 수정
+ *    - 시간 슬롯 생성 로직 변경: generateDayTimeSlots 헬퍼 함수 수정
+ *
+ * 📝 참고사항:
+ *    - 배정된 시간은 파란색/보라색, 차단은 빨간색, 이동은 초록색
+ *    - 요약 바는 24시간 기준 비율로 표시
+ *    - 주간 단위로 표시 (7일)
+ *
+ * ===================================================================================================
+ */
+
+import React, { useState, useEffect, useMemo } from 'react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
+import {
+  getBlockedTimeInfo,
+  getRoomExceptionInfo,
+  generateDayTimeSlots
+} from '../../utils/timetableHelpers';
+
+/**
+ * toYYYYMMDD - 날짜를 YYYY-MM-DD 형식으로 변환
+ *
+ * @param {Date} date - 변환할 날짜
+ * @returns {string|null} YYYY-MM-DD 형식 문자열
+ */
+const toYYYYMMDD = (date) => {
+  const d = new Date(date);
+  if (isNaN(d.getTime())) return null;
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * timeToMinutes - 시간 문자열을 분 단위로 변환
+ *
+ * @param {string} timeStr - HH:MM 형식 시간 문자열
+ * @returns {number} 분 단위 시간
+ */
+const timeToMinutes = (timeStr) => {
+  if (!timeStr || !timeStr.includes(':')) return 0;
+  const [hour, minute] = timeStr.split(':').map(Number);
+  return hour * 60 + minute;
+};
+
+/**
+ * DaySummaryBar - 날짜별 시간 블록 요약 바
+ *
+ * @description 하루의 시간 블록(배정, 차단, 이동, 빈 시간)을 시각적인 바로 표시합니다.
+ * @param {Object} props - 컴포넌트 props
+ * @param {Array<Object>} props.blocks - 하루의 시간 블록 배열
+ * @returns {JSX.Element} 요약 바 UI
+ *
+ * @note
+ * - 각 블록의 너비는 24시간 중 차지하는 비율에 따라 결정됩니다.
+ * - 블록 타입에 따라 다른 색상으로 표시됩니다.
+ */
+const DaySummaryBar = ({ blocks }) => {
+  if (!blocks || blocks.length === 0) {
+    return <div className="w-full h-2 bg-gray-200 rounded-full"></div>;
+  }
+
+  const totalMinutes = 24 * 60;
+
+  return (
+    <div className="w-full h-3 flex rounded-full overflow-hidden border border-gray-300">
+      {blocks.map((block, index) => {
+        const width = (block.duration / totalMinutes) * 100;
+        let bgColor = 'bg-gray-200';
+        let tooltip = `${block.startTime} - ${getEndTimeForBlock(block)}: ${block.name}`;
+
+        switch (block.type) {
+          case 'assigned':
+            // "배정된 시간"만 있는 경우 보라색, 그 외는 파란색
+            const hasOnlyOthers = block.users && block.users.every(u => u === '배정된 시간');
+            const hasSelfAndOthers = block.users && block.users.some(u => u === '배정된 시간') && block.users.some(u => u !== '배정된 시간');
+            if (hasOnlyOthers) {
+              bgColor = 'bg-purple-500';
+            } else if (hasSelfAndOthers) {
+              bgColor = 'bg-indigo-500'; // 혼합: 본인 + 다른 사람
+            } else {
+              bgColor = 'bg-blue-500';
+            }
+            tooltip = `${block.startTime} - ${getEndTimeForBlock(block)}: ${block.users.join(', ')}`;
+            break;
+          case 'blocked':
+            bgColor = 'bg-red-500';
+            break;
+          case 'travel':
+            bgColor = 'bg-green-500';
+            tooltip = `${block.startTime} - ${getEndTimeForBlock(block)}: 이동시간`;
+            break;
+
+          case 'empty':
+            bgColor = 'bg-white';
+            tooltip = `${block.startTime} - ${getEndTimeForBlock(block)}: 빈 시간`;
+            break;
+          default:
+            break;
+        }
+
+        return (
+          <div key={index} className={`h-full ${bgColor}`} style={{ width: `${width}%` }} title={tooltip}></div>
+        );
+      })}
+    </div>
+  );
+};
+
+/**
+ * getEndTimeForBlock - 시간 블록의 종료 시간 계산
+ *
+ * @description 시작 시간과 지속 시간을 기반으로 블록의 종료 시간을 HH:MM 형식으로 계산합니다.
+ * @param {object} block - 시간 블록 객체 (startTime, duration 포함)
+ * @returns {string} HH:MM 형식의 종료 시간
+ *
+ * @example
+ * getEndTimeForBlock({ startTime: '09:00', duration: 90 }); // "10:30"
+ */
+const getEndTimeForBlock = (block) => {
+  const startMinutes = timeToMinutes(block.startTime);
+  const endMinutes = startMinutes + block.duration;
+  const hour = Math.floor(endMinutes / 60) % 24;
+  const min = endMinutes % 60;
+  return `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+};
+
+const CoordinationCalendarView = ({
+  roomData,
+  timeSlots = [],
+  members = [],
+  currentUser,
+  isRoomOwner,
+  onDateClick,
+  selectedDate,
+  ownerOriginalSchedule, // New prop
+  currentWeekStartDate,
+  onWeekChange
+}) => {
+  const [currentDate, setCurrentDate] = useState(new Date());
+
+  useEffect(() => {
+    if (currentWeekStartDate) {
+      setCurrentDate(new Date(currentWeekStartDate));
+    }
+  }, [currentWeekStartDate]);
+
+  /**
+   * getOwnerScheduleInfoForTime - 특정 시간의 방장 일정 정보 조회
+   *
+   * @description 주어진 날짜와 시간에 방장의 일정이 예외, 개인 시간, 선호, 또는 비선호인지 확인합니다.
+   * @param {Date} date - 확인할 날짜
+   * @param {string} time - 확인할 시간 (HH:MM)
+   * @returns {object|null} 방장의 일정 정보 객체 (예: { type: 'exception', ... }) 또는 null
+   *
+   * @note
+   * - `ownerOriginalSchedule` prop을 참조합니다.
+   * - 예외 > 개인 시간 > 비선호 시간 순으로 우선순위를 가집니다.
+   */
+  const getOwnerScheduleInfoForTime = (date, time) => {
+    if (!ownerOriginalSchedule) return null;
+
+    const timeMinutes = timeToMinutes(time);
+    const dayOfWeek = date.getDay();
+    const dateStr = toYYYYMMDD(date);
+
+    const exception = ownerOriginalSchedule.scheduleExceptions?.find(e => {
+      if (e.specificDate !== dateStr) return false;
+      const startMins = timeToMinutes(e.startTime);
+      const endMins = timeToMinutes(e.endTime);
+      return timeMinutes >= startMins && timeMinutes < endMins;
+    });
+    if (exception) return { type: 'exception', ...exception };
+
+    const personal = ownerOriginalSchedule.personalTimes?.find(p => {
+      // specificDate가 있으면 날짜로 비교 (일회성 일정)
+      if (p.specificDate) {
+        if (p.specificDate !== dateStr) return false;
+      } else if (p.isRecurring !== false && p.days?.includes(dayOfWeek)) {
+        // specificDate가 없고 반복되는 경우만
+      } else {
+        return false;
+      }
+
+      const startMins = timeToMinutes(p.startTime);
+      const endMins = timeToMinutes(p.endTime);
+      if (endMins <= startMins) return timeMinutes >= startMins || timeMinutes < endMins;
+      return timeMinutes >= startMins && timeMinutes < endMins;
+    });
+    if (personal) return { type: 'personal', ...personal };
+
+    const preferred = ownerOriginalSchedule.defaultSchedule?.some(s => {
+      // 🔧 수정: specificDate가 있으면 그 날짜에만 적용
+      if (s.specificDate) {
+        if (s.specificDate !== dateStr) return false;
+      } else {
+        // specificDate가 없으면 dayOfWeek로 체크 (반복 일정)
+        if (s.dayOfWeek !== dayOfWeek) return false;
+      }
+
+      return timeMinutes >= timeToMinutes(s.startTime) &&
+             timeMinutes < timeToMinutes(s.endTime);
+    });
+
+    if (preferred) {
+      // 🔍 디버깅: preferred 타입 반환
+      if (time === '09:00') {
+      }
+      return { type: 'preferred' };
+    }
+
+    return { type: 'non_preferred' };
+  };
+
+  /**
+   * getBlocksForDay - 하루의 시간 블록 생성
+   *
+   * @description 주어진 날짜에 대해 10분 단위로 시간 슬롯을 생성하고, 각 슬롯의 상태(배정, 차단, 이동, 빈 시간 등)를 결정하여
+   *              연속된 슬롯들을 하나의 블록으로 병합합니다.
+   * @param {Date} date - 블록을 생성할 날짜
+   * @returns {Array<Object>} 하루의 시간 블록 배열
+   *
+   * @note
+   * - `generateDayTimeSlots`, `getBlockedTimeInfo`, `getRoomExceptionInfo`, `getOwnerScheduleInfoForTime` 등 여러 헬퍼 함수를 사용하여 각 슬롯의 상태를 결정합니다.
+   * - 방장이 아닌 경우 다른 사람의 슬롯은 '배정된 시간'으로 익명 처리됩니다.
+   */
+  const getBlocksForDay = (date) => {
+    const allPossibleSlots = generateDayTimeSlots(0, 24);
+    const slotMap = new Map();
+
+    allPossibleSlots.forEach(time => {
+      const blockingInfo = getBlockedTimeInfo(time, roomData.settings) || getRoomExceptionInfo(date, time, roomData.settings);
+      const assignedSlots = timeSlots.filter(slot =>
+        toYYYYMMDD(slot.date) === toYYYYMMDD(date) &&
+        time >= slot.startTime && time < slot.endTime
+      );
+      const travelSlot = assignedSlots.find(slot => slot.isTravel);
+      const activitySlots = assignedSlots.filter(slot => !slot.isTravel);
+
+      const ownerInfo = getOwnerScheduleInfoForTime(date, time);
+
+      let event = null;
+      if (blockingInfo) {
+        event = { type: 'blocked', name: blockingInfo.name };
+      } else if (travelSlot) {
+        event = { type: 'travel', name: '이동시간' };
+      } else if (activitySlots.length > 0) {
+        const userNames = assignedSlots.map(slot => {
+            // 현재 사용자의 슬롯인지 확인
+            const slotUserId = slot.user?._id?.toString() || slot.user?.toString();
+            const currentUserId = currentUser?.id?.toString() || currentUser?._id?.toString();
+            const isOwnSlot = slotUserId && currentUserId && slotUserId === currentUserId;
+
+            // 방장이 아닌 경우: 본인 슬롯은 이름 표시, 다른 사람은 "다른 사람"
+            if (!isRoomOwner) {
+              if (isOwnSlot) {
+                // 본인 슬롯: 이름 표시
+                if (slot.user && typeof slot.user === 'object' && slot.user._id) {
+                  const user = slot.user;
+                  return `${user.firstName || ''} ${user.lastName || ''}`.trim() || '나';
+                }
+                return '나';
+              } else {
+                // 다른 사람 슬롯
+                return '배정된 시간';
+              }
+            }
+
+            // 방장인 경우: 모든 이름 표시
+            // slot.user가 populate되어 있으면 직접 사용 (우선순위 1)
+            if (slot.user && typeof slot.user === 'object' && slot.user._id) {
+              const user = slot.user;
+              return `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.firstName || '알 수 없음';
+            }
+
+            // slot.user가 ObjectId만 있으면 members에서 찾기 (우선순위 2)
+            const member = members.find(m => {
+              const memberUserId = m.user?._id?.toString() || m.user?.toString();
+              const slotUserIdInner = slot.user?._id?.toString() || slot.user?.toString();
+              return memberUserId && slotUserIdInner && memberUserId === slotUserIdInner;
+            });
+
+            if (member && member.user && typeof member.user === 'object') {
+              const user = member.user;
+              return `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.firstName || '알 수 없음';
+            }
+
+            return '알 수 없음';
+        }).filter(Boolean).sort();
+        const uniqueUserNames = [...new Set(userNames)];
+        event = { type: 'assigned', name: uniqueUserNames.join(', '), users: uniqueUserNames };
+      } else if (ownerInfo?.type === 'personal') {
+        // personalTimes는 방장의 개인 일정이므로 배정 불가능
+        event = { type: 'blocked', name: ownerInfo.title || '방장 개인일정' };
+      } else if (ownerInfo?.type === 'non_preferred') {
+        event = { type: 'blocked', name: '방장 불가능' };
+      }
+      // preferred 타입은 무시 (선호시간이므로 빈 시간으로 유지 = 배정 가능)
+      slotMap.set(time, event);
+    });
+
+    const blocks = [];
+    let currentBlock = null;
+
+    allPossibleSlots.forEach(time => {
+      const event = slotMap.get(time);
+      const currentEventType = event ? event.type : 'empty';
+      const currentEventName = event ? event.name : 'empty';
+
+      if (currentBlock && currentBlock.type === currentEventType && currentBlock.name === currentEventName) {
+        currentBlock.duration += 10;
+      } else {
+        if (currentBlock) blocks.push(currentBlock);
+        currentBlock = { type: currentEventType, name: currentEventName, startTime: time, duration: 10, users: event?.users };
+      }
+    });
+
+    if (currentBlock) blocks.push(currentBlock);
+    return blocks;
+  };
+
+  const calendarDates = useMemo(() => {
+    const year = currentDate.getFullYear();
+    const month = currentDate.getMonth();
+    const firstDay = new Date(year, month, 1);
+    const startDate = new Date(firstDay);
+    startDate.setDate(firstDay.getDate() - firstDay.getDay());
+
+    const dates = [];
+    for (let i = 0; i < 42; i++) {
+      const date = new Date(startDate);
+      date.setDate(startDate.getDate() + i);
+      dates.push({
+        date: new Date(date),
+        day: date.getDate(),
+        isCurrentMonth: date.getMonth() === month,
+        isToday: toYYYYMMDD(date) === toYYYYMMDD(new Date()),
+        isSelected: selectedDate && toYYYYMMDD(date) === toYYYYMMDD(selectedDate),
+        blocks: getBlocksForDay(date),
+      });
+    }
+    return dates;
+  }, [currentDate, selectedDate, timeSlots, members, roomData, ownerOriginalSchedule]);
+
+
+  const monthNames = ['1월', '2월', '3월', '4월', '5월', '6월', '7월', '8월', '9월', '10월', '11월', '12월'];
+  const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
+
+  /**
+   * navigateMonth - 월 이동 처리
+   *
+   * @description 현재 표시된 월을 이전 또는 다음 달로 변경합니다.
+   * @param {number} direction - 이동 방향 (-1: 이전 달, 1: 다음 달)
+   */
+  const navigateMonth = (direction) => {
+    const newDate = new Date(currentDate);
+    newDate.setMonth(currentDate.getMonth() + direction);
+    setCurrentDate(newDate);
+    if (onWeekChange) onWeekChange(toYYYYMMDD(newDate));
+  };
+
+  /**
+   * goToToday - '오늘'로 이동
+   *
+   * @description 캘린더 뷰를 현재 날짜가 포함된 월로 이동합니다.
+   */
+  const goToToday = () => {
+    const today = new Date();
+    setCurrentDate(today);
+    if (onWeekChange) onWeekChange(toYYYYMMDD(today));
+  };
+
+  return (
+    <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+       <div className="flex items-center justify-between p-4">
+        <h2 className="text-xl font-semibold">
+          {`${currentDate.getFullYear()}년 ${monthNames[currentDate.getMonth()]}`}
+        </h2>
+        <div className="flex items-center space-x-2">
+          <button onClick={() => navigateMonth(-1)} className="p-2 rounded-lg bg-gray-200 hover:bg-gray-300 transition-colors"><ChevronLeft size={16} /></button>
+          <button onClick={goToToday} className="px-3 py-2 rounded-lg bg-blue-500 text-white hover:bg-blue-600 transition-colors text-sm">오늘</button>
+          <button onClick={() => navigateMonth(1)} className="p-2 rounded-lg bg-gray-200 hover:bg-gray-300 transition-colors"><ChevronRight size={16} /></button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-7 bg-gray-50 border-y border-gray-200">
+        {dayNames.map((dayName, index) => (
+          <div key={index} className={`p-3 text-center text-sm font-medium ${index === 0 ? 'text-red-500' : index === 6 ? 'text-blue-500' : 'text-gray-700'}`}>
+            {dayName}
+          </div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-7">
+        {calendarDates.map((dateInfo, index) => (
+          <div
+            key={index}
+            className={`h-32 border-r border-b border-gray-100 p-2 cursor-pointer transition-colors ${dateInfo.isCurrentMonth ? 'bg-white hover:bg-blue-50' : 'bg-gray-50 text-gray-400'} ${dateInfo.isToday ? 'bg-blue-100' : ''} ${dateInfo.isSelected ? 'bg-blue-200 ring-2 ring-blue-500' : ''}`}
+            onClick={() => onDateClick(dateInfo.date)}
+          >
+            <div className={`text-sm font-medium mb-2 ${dateInfo.isToday ? 'text-blue-600' : ''}`}>
+              {dateInfo.day}
+            </div>
+            <div className="space-y-1">
+              <DaySummaryBar blocks={dateInfo.blocks} />
+              <div className="flex flex-wrap gap-1 mt-1 overflow-y-auto" style={{maxHeight: '4.5rem'}}>
+                {Array.from(new Set(dateInfo.blocks.filter(b => b.type === 'assigned').flatMap(b => b.users || []))).map((name, i) => (
+                  <span
+                    key={`user-${i}`}
+                    className={`text-sm px-1.5 py-0.5 rounded-full ${
+                      name === '배정된 시간'
+                        ? 'bg-purple-100 text-purple-800'
+                        : 'bg-blue-100 text-blue-800'
+                    }`}
+                  >
+                    {name}
+                  </span>
+                ))}
+                {Array.from(new Set(dateInfo.blocks.filter(b => b.type === 'blocked').map(b => b.name))).map((name, i) => (
+                  <span key={`block-${i}`} className="text-sm bg-red-100 text-red-800 px-1.5 py-0.5 rounded-full">{name}</span>
+                ))}
+                {dateInfo.blocks.some(b => b.type === 'travel') && (
+                  <span className="text-xs bg-green-100 text-green-800 px-1.5 py-0.5 rounded-full">이동시간</span>
+                )}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+export default CoordinationCalendarView;
