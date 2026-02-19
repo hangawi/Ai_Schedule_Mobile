@@ -1,14 +1,13 @@
 // 스케줄 확정 서비스
 const User = require('../../../models/user');
 const ActivityLog = require('../../../models/ActivityLog');
-const { VALIDATION_RULES } = require('../constants/validationRules');
-const { mergeConsecutiveSlots } = require('../utils/slotUtils');
-const { getDayOfWeekNumber } = require('../utils/timeUtils');
+const { VALIDATION_RULES, HTTP_STATUS, ERROR_MESSAGES } = require('../../coordinationScheduling/constants');
+const { mergeConsecutiveSlots } = require('../../coordinationScheduling/helpers');
+const { getDayOfWeekNumber } = require('../../coordinationScheduling/utils');
 const { removePreferenceTimes } = require('../helpers/preferenceTimeHelper');
 
-const Room = require('../../../models/room'); // Room 모델 추가
-const { validateRoomExists, validateOwnerPermission } = require('../validators'); // 검증 헬퍼 추가
-const { HTTP_STATUS, ERROR_MESSAGES } = require('../constants'); // 상수 추가
+const Room = require('../../../models/room');
+const { validateRoomExists, validateOwnerPermission } = require('../../coordinationScheduling/validators');
 
 /**
  * 슬롯을 사용자별, 날짜별로 그룹화

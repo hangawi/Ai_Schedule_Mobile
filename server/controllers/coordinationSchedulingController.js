@@ -56,15 +56,12 @@ const {
   runAutoScheduling,
   applySchedulingResult,
 } = require('./coordinationScheduling/schedulingService');
-const { confirmSlotsToPersonalCalendar } = require('./coordinationSchedulingController/services/scheduleConfirmService');
+const { confirmSlotsToPersonalCalendar, saveUserWithRetry } = require('./coordinationSchedulingController/services/scheduleConfirmService');
 const {
   applyTravelMode,
   confirmTravelMode,
   validateScheduleWithTransportMode,
 } = require('./coordinationScheduling/travelModeService');
-
-// Schedule Confirmation Service
-const { confirmSlotsToPersonalCalendar, saveUserWithRetry } = require('./coordinationSchedulingController/services/scheduleConfirmService');
 
 // @desc    Run auto-schedule algorithm for the room
 // @route   POST /api/coordination/rooms/:roomId/auto-schedule
@@ -1136,4 +1133,9 @@ exports.setAutoConfirmDuration = async (req, res) => {
     });
   }
 };
+
+// travelModeService에서 re-export
+exports.applyTravelMode = applyTravelMode;
+exports.confirmTravelMode = confirmTravelMode;
+exports.validateScheduleWithTransportMode = validateScheduleWithTransportMode;
 

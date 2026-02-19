@@ -103,17 +103,6 @@ const MobileCalendarView = ({ user, isClipboardMonitoring, setIsClipboardMonitor
       setCalendarView, setCurrentTitle,
    });
 
-   // --- 음성 인식 훅 ---
-   const { handleStartVoiceRecognition } = useVoiceRecognition({
-      showToast,
-      setIsVoiceEnabled,
-      isChatOpen,
-      setIsChatOpen,
-      handleChatMessage,
-      isBackgroundMonitoring,
-      processTranscript,
-   });
-
    // --- 백그라운드 대화 감지 훅 ---
    const {
       isBackgroundMonitoring,
@@ -126,6 +115,17 @@ const MobileCalendarView = ({ user, isClipboardMonitoring, setIsClipboardMonitor
       isAnalyzing: isBackgroundAnalyzing,
       backgroundTranscript
    } = useBackgroundMonitoring(eventActions, setEventAddedKey);
+
+   // --- 음성 인식 훅 ---
+   const { handleStartVoiceRecognition } = useVoiceRecognition({
+      showToast,
+      setIsVoiceEnabled,
+      isChatOpen,
+      setIsChatOpen,
+      handleChatMessage,
+      isBackgroundMonitoring,
+      processTranscript,
+   });
 
    // --- 쿼리 파라미터 처리 ---
    useEffect(() => {
